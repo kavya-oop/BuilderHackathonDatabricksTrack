@@ -619,13 +619,44 @@ struct FastSession {
     purchasing: bool,
 }
 
+#[derive(Default)]
 struct FastUserDaily {
-    person: u64,
-    day: i32,
-    sessions: u64,
-    events: u64,
-    revenue: u64,
-    top_category: Option<u32>,
+    persons: Vec<u64>,
+    days: Vec<i32>,
+    sessions: Vec<i64>,
+    events: Vec<i64>,
+    revenue: Vec<i64>,
+    top_categories: Vec<u32>,
+}
+
+impl FastUserDaily {
+    fn len(&self) -> usize {
+        self.persons.len()
+    }
+
+    fn push(
+        &mut self,
+        person: u64,
+        day: i32,
+        sessions: u64,
+        events: u64,
+        revenue: u64,
+        top_category: Option<u32>,
+    ) {
+        self.persons.push(person);
+        self.days.push(day);
+        self.sessions.push(sessions as i64);
+        self.events.push(events as i64);
+        self.revenue.push(revenue as i64);
+        self.top_categories.push(top_category.unwrap_or(NONE));
+    }
+
+    fn totals(&self) -> (u64, u64) {
+        (
+            self.sessions.iter().map(|&value| value as u64).sum(),
+            self.revenue.iter().map(|&value| value as u64).sum(),
+        )
+    }
 }
 
 #[derive(Default)]
@@ -701,7 +732,7 @@ impl LocalIdentity {
 
 struct ReplayShardAggregate {
     session_count: usize,
-    user_daily: Vec<FastUserDaily>,
+    user_daily: FastUserDaily,
     campaign_daily: Vec<CampaignDaily>,
     shared_events: Vec<semantic::SemanticEvent>,
     shared_clicks: Vec<semantic::SemanticClick>,
@@ -1068,7 +1099,7 @@ fn try_run_generator_replay(
         .map(|user_ranges| {
             let mut result = ReplayShardAggregate {
                 session_count: 0,
-                user_daily: Vec::new(),
+                user_daily: FastUserDaily::default(),
                 campaign_daily: vec![CampaignDaily::default(); campaign_rows],
                 shared_events: Vec::new(),
                 shared_clicks: Vec::new(),
@@ -1317,7 +1348,13 @@ fn try_run_generator_replay(
         "replay attribution complete in {:.3}s",
         started.elapsed().as_secs_f64()
     );
-    write_fast_user_daily_parts(&output.join("user_daily"), &user_daily_parts, categories)?;
+    let (user_sessions, user_revenue) = user_daily_parts
+        .iter()
+        .map(FastUserDaily::totals)
+        .fold((0u64, 0u64), |(sessions, revenue), partial| {
+            (sessions + partial.0, revenue + partial.1)
+        });
+    write_fast_user_daily_parts(&output.join("user_daily"), user_daily_parts, categories)?;
     write_campaign_daily(
         &output.join("campaign_daily/part-0.parquet"),
         &campaign_daily,
@@ -1330,12 +1367,6 @@ fn try_run_generator_replay(
         "replay parquet output complete in {:.3}s",
         started.elapsed().as_secs_f64()
     );
-    let (user_sessions, user_revenue) = user_daily_parts
-        .iter()
-        .flatten()
-        .fold((0u64, 0u64), |(sessions, revenue), row| {
-            (sessions + row.sessions, revenue + row.revenue)
-        });
     let (campaign_sessions, campaign_revenue) = campaign_daily
         .iter()
         .fold((0u64, 0u64), |(sessions, revenue), row| {
@@ -1701,9 +1732,18 @@ fn try_run_generated_fast(
     );
     drop(clicks);
 
+    let (user_sessions, user_revenue) = user_daily.totals();
+    let campaign_sessions: u64 = campaign_daily.iter().map(|row| row.sessions).sum();
+    let campaign_revenue: u64 = campaign_daily.iter().map(|row| row.revenue).sum();
+    if user_sessions != campaign_sessions || user_revenue != campaign_revenue {
+        return Err(format!(
+            "fast self-check failed: users ({user_sessions}, {user_revenue}) campaigns ({campaign_sessions}, {campaign_revenue})"
+        )
+        .into());
+    }
     write_fast_user_daily(
         &output.join("user_daily/part-0.parquet"),
-        &user_daily,
+        user_daily,
         categories,
         first_day,
         day_count,
@@ -1716,16 +1756,6 @@ fn try_run_generated_fast(
         first_day,
         day_count,
     )?;
-    let user_sessions: u64 = user_daily.iter().map(|row| row.sessions).sum();
-    let user_revenue: u64 = user_daily.iter().map(|row| row.revenue).sum();
-    let campaign_sessions: u64 = campaign_daily.iter().map(|row| row.sessions).sum();
-    let campaign_revenue: u64 = campaign_daily.iter().map(|row| row.revenue).sum();
-    if user_sessions != campaign_sessions || user_revenue != campaign_revenue {
-        return Err(format!(
-            "fast self-check failed: users ({user_sessions}, {user_revenue}) campaigns ({campaign_sessions}, {campaign_revenue})"
-        )
-        .into());
-    }
     eprintln!(
         "fast Rust core finished in {:.3}s",
         started.elapsed().as_secs_f64()
@@ -1776,9 +1806,9 @@ fn read_fast_links(files: &[PathBuf]) -> Result<Option<U64Map<u64>>> {
 fn fast_sessionize(
     events: &[FastEvent],
     categories: &[Vec<u8>],
-) -> (Vec<FastSession>, Vec<FastUserDaily>) {
+) -> (Vec<FastSession>, FastUserDaily) {
     let mut sessions = Vec::new();
-    let mut user_daily = Vec::new();
+    let mut user_daily = FastUserDaily::default();
     fast_sessionize_append(events, categories, &mut sessions, &mut user_daily);
     (sessions, user_daily)
 }
@@ -1787,7 +1817,7 @@ fn fast_sessionize_append(
     events: &[FastEvent],
     categories: &[Vec<u8>],
     sessions: &mut Vec<FastSession>,
-    user_daily: &mut Vec<FastUserDaily>,
+    user_daily: &mut FastUserDaily,
 ) {
     let mut category_sums = vec![0u64; categories.len()];
     let mut touched = Vec::with_capacity(categories.len().min(64));
@@ -1805,7 +1835,7 @@ fn fast_sessionize_append_with_scratch(
     events: &[FastEvent],
     categories: &[Vec<u8>],
     sessions: &mut Vec<FastSession>,
-    user_daily: &mut Vec<FastUserDaily>,
+    user_daily: &mut FastUserDaily,
     category_sums: &mut [u64],
     touched: &mut Vec<u32>,
 ) {
@@ -1909,7 +1939,7 @@ fn semantic_sessionize_append_with_scratch(
     unknown_category: u32,
     categories: &[Vec<u8>],
     sessions: &mut Vec<FastSession>,
-    user_daily: &mut Vec<FastUserDaily>,
+    user_daily: &mut FastUserDaily,
     category_sums: &mut [u64],
     touched: &mut Vec<u32>,
 ) {
@@ -2011,7 +2041,7 @@ fn semantic_sessionize_append_with_scratch(
 
 #[allow(clippy::too_many_arguments)]
 fn finish_fast_user_day(
-    output: &mut Vec<FastUserDaily>,
+    output: &mut FastUserDaily,
     person: u64,
     day: i32,
     sessions: u64,
@@ -2037,14 +2067,14 @@ fn finish_fast_user_day(
             Some(best) => Some(best),
         };
     }
-    output.push(FastUserDaily {
+    output.push(
         person,
         day,
         sessions,
         events,
         revenue,
-        top_category: top,
-    });
+        top,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2174,42 +2204,31 @@ fn fast_attribute_and_assist_with_scratch(
 
 fn write_fast_user_daily(
     path: &Path,
-    rows: &[FastUserDaily],
+    rows: FastUserDaily,
     categories: &[Vec<u8>],
     _first_day: i32,
     _day_count: usize,
 ) -> Result<()> {
     let folder = path.parent().ok_or("user output path has no parent")?;
     fs::create_dir_all(folder)?;
-    let parts = rayon::current_num_threads().min(rows.len().max(1));
-    let chunk_size = rows.len().max(1).div_ceil(parts);
-    rows.par_chunks(chunk_size)
-        .enumerate()
-        .map(|(part, chunk)| {
-            write_fast_user_daily_part(
-                &folder.join(format!("part-{part}.parquet")),
-                chunk,
-                categories,
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if rows.is_empty() {
-        write_fast_user_daily_part(path, rows, categories)?;
-    }
-    Ok(())
+    write_fast_user_daily_part(path, rows, categories)
 }
 
 fn write_fast_user_daily_parts(
     folder: &Path,
-    parts: &[Vec<FastUserDaily>],
+    parts: Vec<FastUserDaily>,
     categories: &[Vec<u8>],
 ) -> Result<()> {
     fs::create_dir_all(folder)?;
     if parts.is_empty() {
-        return write_fast_user_daily_part(&folder.join("part-0.parquet"), &[], categories);
+        return write_fast_user_daily_part(
+            &folder.join("part-0.parquet"),
+            FastUserDaily::default(),
+            categories,
+        );
     }
     parts
-        .par_iter()
+        .into_par_iter()
         .enumerate()
         .map(|(part, rows)| {
             write_fast_user_daily_part(
@@ -2224,32 +2243,36 @@ fn write_fast_user_daily_parts(
 
 fn write_fast_user_daily_part(
     path: &Path,
-    rows: &[FastUserDaily],
+    rows: FastUserDaily,
     categories: &[Vec<u8>],
 ) -> Result<()> {
-    let mut user_keys = Vec::with_capacity(rows.len());
-    let mut user_values = MutableUtf8Array::<i32>::with_capacities(rows.len() / 3, rows.len() * 3);
-    let mut days = Vec::with_capacity(rows.len());
-    let mut sessions = Vec::with_capacity(rows.len());
-    let mut events = Vec::with_capacity(rows.len());
-    let mut revenue = Vec::with_capacity(rows.len());
-    let mut top_keys = MutablePrimitiveArray::<i32>::with_capacity(rows.len());
+    let row_count = rows.len();
+    let FastUserDaily {
+        persons,
+        days,
+        sessions,
+        events,
+        revenue,
+        top_categories,
+    } = rows;
+    let mut user_keys = Vec::with_capacity(row_count);
+    let mut user_values =
+        MutableUtf8Array::<i32>::with_capacities(row_count / 3, row_count * 3);
+    let mut top_keys = MutablePrimitiveArray::<i32>::with_capacity(row_count);
     let mut user = Vec::with_capacity(9);
     let mut last_person = None;
     let mut user_key = -1i32;
-    for row in rows {
-        if last_person != Some(row.person) {
-            unpack_identifier(row.person, &mut user);
+    for person in persons {
+        if last_person != Some(person) {
+            unpack_identifier(person, &mut user);
             user_values.push(Some(std::str::from_utf8(&user)?));
             user_key += 1;
-            last_person = Some(row.person);
+            last_person = Some(person);
         }
         user_keys.push(user_key);
-        days.push(row.day);
-        sessions.push(row.sessions as i64);
-        events.push(row.events as i64);
-        revenue.push(row.revenue as i64);
-        if let Some(category) = row.top_category {
+    }
+    for category in top_categories {
+        if category != NONE {
             top_keys.push(Some(category as i32));
         } else {
             top_keys.push(None);
