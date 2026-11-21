@@ -31,7 +31,6 @@ const LAST_SLOT_OF_DAY: usize = SLOTS_PER_DAY - 1;
 const MOST_SESSIONS_TO_CROSS: usize = 80;
 const BAD_ORIGINAL_SHARE: f64 = 0.02;
 const ODD_PRICE_SHARE: f64 = 0.001;
-const EARLY_INGEST_SHARE: f64 = 0.005;
 const SAME_MILLISECOND_SHARE: f64 = 0.01;
 const CLICK_REACH: i64 = 7 * DAY;
 const FIRST_ALIAS_THRESHOLD: u64 = chance_threshold(FIRST_ALIAS_SHARE);
@@ -48,7 +47,6 @@ const SELF_LINK_THRESHOLD: u64 = chance_threshold(SELF_LINK_SHARE);
 const REPEATED_LINK_THRESHOLD: u64 = chance_threshold(REPEATED_LINK_SHARE);
 const HALF_THRESHOLD: u64 = chance_threshold(0.5);
 const LINK_CASE_VARIANT_THRESHOLD: u64 = chance_threshold(LINK_CASE_VARIANT);
-const EARLY_INGEST_THRESHOLD: u64 = chance_threshold(EARLY_INGEST_SHARE);
 
 #[derive(Clone, Copy)]
 pub struct SemanticEvent {
@@ -779,11 +777,10 @@ fn ingest_validity(random: &mut Random, late_threshold: u64, ts: i64) -> (bool, 
             random.skip(1);
             (false, false)
         }
-    } else if random.chance_with_threshold(EARLY_INGEST_THRESHOLD) {
-        random.skip(1);
-        (true, true)
     } else {
-        random.skip(1);
+        // Early-ingest formatting consumes one draw and its timestamp consumes
+        // one more, but neither value affects semantic validity here.
+        random.skip(2);
         (true, true)
     }
 }
