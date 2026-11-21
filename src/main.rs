@@ -1138,11 +1138,18 @@ fn try_run_generator_replay(
                     return;
                 }
 
-                identity.rebuild(&shard.links, &dataset);
+                let identity_is_trivial = shard.links.iter().all(|&(left, right)| left == right);
+                if !identity_is_trivial {
+                    identity.rebuild(&shard.links, &dataset);
+                }
                 aliases.clear();
                 for alias in 0..u64::from(user_plan.aliases.max(1)) {
                     let person = index as u64 * semantic::ALIAS_SLOTS + alias;
-                    aliases.push(identity.canonical(person, &dataset));
+                    aliases.push(if identity_is_trivial {
+                        semantic::packed_person(&dataset, person)
+                    } else {
+                        identity.canonical(person, &dataset)
+                    });
                 }
 
                 sessions.clear();
@@ -1174,6 +1181,8 @@ fn try_run_generator_replay(
                     for event in &shard.events {
                         let person = if event.person & semantic::EXCEPTIONAL_PERSON == 0 {
                             aliases[(event.person % semantic::ALIAS_SLOTS) as usize]
+                        } else if identity_is_trivial {
+                            semantic::packed_person(&dataset, event.person)
                         } else {
                             identity.canonical(event.person, &dataset)
                         };
@@ -1215,6 +1224,8 @@ fn try_run_generator_replay(
                         person
                     } else if click.person & semantic::EXCEPTIONAL_PERSON == 0 {
                         aliases[(click.person % semantic::ALIAS_SLOTS) as usize]
+                    } else if identity_is_trivial {
+                        semantic::packed_person(&dataset, click.person)
                     } else {
                         identity.canonical(click.person, &dataset)
                     };
