@@ -1210,7 +1210,8 @@ fn try_run_generator_replay(
         })
         .collect();
 
-    let mut user_daily = Vec::new();
+    let mut user_daily_parts = Vec::with_capacity(shard_results.len() + 1);
+    let mut user_daily_rows = 0usize;
     let mut campaign_daily = vec![CampaignDaily::default(); campaign_rows];
     let mut shared_events = Vec::new();
     let mut shared_clicks = Vec::new();
@@ -1218,7 +1219,8 @@ fn try_run_generator_replay(
     let mut session_count = 0usize;
     for mut shard in shard_results {
         session_count += shard.session_count;
-        user_daily.append(&mut shard.user_daily);
+        user_daily_rows += shard.user_daily.len();
+        user_daily_parts.push(shard.user_daily);
         shared_events.append(&mut shard.shared_events);
         shared_clicks.append(&mut shard.shared_clicks);
         shared_links.append(&mut shard.shared_links);
@@ -1290,7 +1292,7 @@ fn try_run_generator_replay(
                 .then_with(|| left.ts.cmp(&right.ts))
                 .then_with(|| semantic::compare_click_ids(right.id, left.id))
         });
-        let (mut sessions, mut shared_user_daily) = fast_sessionize(&events, categories);
+        let (mut sessions, shared_user_daily) = fast_sessionize(&events, categories);
         session_count += sessions.len();
         fast_attribute_and_assist(
             &sessions,
@@ -1301,26 +1303,21 @@ fn try_run_generator_replay(
             day_count,
             &mut campaign_daily,
         );
-        user_daily.append(&mut shared_user_daily);
+        user_daily_rows += shared_user_daily.len();
+        user_daily_parts.push(shared_user_daily);
         sessions.clear();
     }
     eprintln!(
         "replay streamed {} sessions and {} user-days in {:.3}s",
         session_count,
-        user_daily.len(),
+        user_daily_rows,
         started.elapsed().as_secs_f64()
     );
     eprintln!(
         "replay attribution complete in {:.3}s",
         started.elapsed().as_secs_f64()
     );
-    write_fast_user_daily(
-        &output.join("user_daily/part-0.parquet"),
-        &user_daily,
-        categories,
-        first_day,
-        day_count,
-    )?;
+    write_fast_user_daily_parts(&output.join("user_daily"), &user_daily_parts, categories)?;
     write_campaign_daily(
         &output.join("campaign_daily/part-0.parquet"),
         &campaign_daily,
@@ -1333,10 +1330,17 @@ fn try_run_generator_replay(
         "replay parquet output complete in {:.3}s",
         started.elapsed().as_secs_f64()
     );
-    let user_sessions: u64 = user_daily.iter().map(|row| row.sessions).sum();
-    let user_revenue: u64 = user_daily.iter().map(|row| row.revenue).sum();
-    let campaign_sessions: u64 = campaign_daily.iter().map(|row| row.sessions).sum();
-    let campaign_revenue: u64 = campaign_daily.iter().map(|row| row.revenue).sum();
+    let (user_sessions, user_revenue) = user_daily_parts
+        .iter()
+        .flatten()
+        .fold((0u64, 0u64), |(sessions, revenue), row| {
+            (sessions + row.sessions, revenue + row.revenue)
+        });
+    let (campaign_sessions, campaign_revenue) = campaign_daily
+        .iter()
+        .fold((0u64, 0u64), |(sessions, revenue), row| {
+            (sessions + row.sessions, revenue + row.revenue)
+        });
     if user_sessions != campaign_sessions || user_revenue != campaign_revenue {
         return Err("replay self-check failed".into());
     }
@@ -2192,6 +2196,29 @@ fn write_fast_user_daily(
     if rows.is_empty() {
         write_fast_user_daily_part(path, rows, categories)?;
     }
+    Ok(())
+}
+
+fn write_fast_user_daily_parts(
+    folder: &Path,
+    parts: &[Vec<FastUserDaily>],
+    categories: &[Vec<u8>],
+) -> Result<()> {
+    fs::create_dir_all(folder)?;
+    if parts.is_empty() {
+        return write_fast_user_daily_part(&folder.join("part-0.parquet"), &[], categories);
+    }
+    parts
+        .par_iter()
+        .enumerate()
+        .map(|(part, rows)| {
+            write_fast_user_daily_part(
+                &folder.join(format!("part-{part}.parquet")),
+                rows,
+                categories,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(())
 }
 
