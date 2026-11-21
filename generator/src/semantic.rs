@@ -8,7 +8,11 @@ use crate::plan::{
 use crate::random::{Random, Stream};
 use crate::text::{scramble, DAY, HOUR, MINUTE, SECOND};
 
-const ALIAS_SLOTS: u64 = 512;
+pub const ALIAS_SLOTS: u64 = 512;
+/// Normal generated people are represented by their dense pre-scramble alias
+/// number. Only case-variant IDs need the packed byte representation during
+/// replay; the high bit tags those rare values.
+pub const EXCEPTIONAL_PERSON: u64 = 1 << 63;
 const KIOSK_BASE: u64 = 1 << 39;
 const FIRST_ALIAS_SHARE: f64 = 0.5;
 const REPEATED_LINK_SHARE: f64 = 0.08;
@@ -54,6 +58,34 @@ pub struct Shard {
     pub events: Vec<SemanticEvent>,
     pub clicks: Vec<SemanticClick>,
     pub links: Vec<(u64, u64)>,
+}
+
+/// Replays one generator shard while exposing each completed user's compact
+/// semantic rows to the caller. The buffers are cleared and reused after the
+/// callback, so the normal path never retains the full synthetic dataset.
+pub fn generate_shard_with<F>(
+    dataset: &Dataset,
+    users: std::ops::Range<usize>,
+    mut consume: F,
+) where
+    F: FnMut(usize, UserPlan, &mut Shard),
+{
+    let mut shard = Shard {
+        events: Vec::new(),
+        clicks: Vec::new(),
+        links: Vec::new(),
+    };
+    for index in users {
+        let plan = dataset.users[index];
+        if plan.events == 0 {
+            continue;
+        }
+        SemanticUser::new(dataset, index, plan).generate(&mut shard);
+        consume(index, plan, &mut shard);
+        shard.events.clear();
+        shard.clicks.clear();
+        shard.links.clear();
+    }
 }
 
 pub fn generate_shard(dataset: &Dataset, users: std::ops::Range<usize>) -> Shard {
@@ -123,13 +155,13 @@ impl<'a> SemanticUser<'a> {
         }
     }
 
-    fn user_field(&mut self, id: u64) -> Option<u64> {
+    fn user_field(&mut self, number: u64, id: u64) -> Option<u64> {
         if self.random.chance(self.dataset.rates.bad_user) {
             None
         } else if self.random.chance(self.dataset.rates.case_variant) {
-            Some(uppercase_packed(id))
+            Some(EXCEPTIONAL_PERSON | uppercase_packed(id))
         } else {
-            Some(id)
+            Some(number)
         }
     }
 
@@ -219,7 +251,8 @@ impl<'a> SemanticUser<'a> {
         let rates = &self.dataset.rates;
         let _event_id_case_variant = self.random.chance(rates.case_variant);
         let alias = Self::alias(&mut self.random, &self.plan, self.ids.len());
-        let mut person = self.user_field(self.ids[alias]);
+        let number = self.index as u64 * ALIAS_SLOTS + alias as u64;
+        let mut person = self.user_field(number, self.ids[alias]);
 
         let timestamp_is_bad = self.random.chance(rates.bad_timestamp);
         if timestamp_is_bad {
@@ -306,7 +339,7 @@ impl<'a> SemanticUser<'a> {
         }
         if original_present && copies > 0 && scramble(index, self.dataset.click_key) % 64 == 0 {
             let other = (self.index + 1) % self.dataset.users.len();
-            person = Some(user_id(self.dataset, other as u64 * ALIAS_SLOTS));
+            person = Some(other as u64 * ALIAS_SLOTS);
         }
         for _ in 0..copies {
             let later = ingest_ts + self.random.between(1, 600) * SECOND;
@@ -370,7 +403,8 @@ impl<'a> SemanticUser<'a> {
             id_case_variant,
         );
         let alias = Self::alias(&mut self.random, &self.plan, self.ids.len());
-        let person = self.user_field(self.ids[alias]);
+        let number = self.index as u64 * ALIAS_SLOTS + alias as u64;
+        let person = self.user_field(number, self.ids[alias]);
         let campaign = if self.random.chance(rates.unknown_campaign) {
             if self.random.chance(UPPERCASE_CAMPAIGN_SHARE) {
                 let _ = self.random.between(1, CAMPAIGNS as i64);
@@ -487,7 +521,7 @@ impl<'a> SemanticUser<'a> {
     }
 }
 
-fn user_id(dataset: &Dataset, number: u64) -> u64 {
+pub fn user_id(dataset: &Dataset, number: u64) -> u64 {
     packed_id(b'u', scramble(number, dataset.user_key), false)
 }
 

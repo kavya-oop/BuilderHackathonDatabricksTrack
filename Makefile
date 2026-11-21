@@ -1,7 +1,7 @@
 IMAGE ?= shopping-sessions:latest
 PLATFORM ?= linux/amd64
 CPUS ?= 8
-MEM ?= 7g
+MEM ?= 24g
 
 .PHONY: build fixtures run-dev check-dev
 
@@ -17,7 +17,7 @@ run-dev:
 	docker run --rm --network none --cpus $(CPUS) --memory $(MEM) \
 		--read-only --tmpfs /tmp:rw,size=64m --user 1000:1000 \
 		-e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch \
-		-e NCPU=$(CPUS) -e MEM_GB=7 \
+		-e NCPU=$(CPUS) -e MEM_GB=24 \
 		-v "$$(pwd)/dev:/data:ro" -v "$$(pwd)/output:/output" \
 		-v "$$(pwd)/scratch:/scratch" $(IMAGE)
 
