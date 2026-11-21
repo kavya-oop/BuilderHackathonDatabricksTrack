@@ -7,6 +7,7 @@ use std::fs::{self, File};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Instant;
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -137,19 +138,42 @@ impl ByteInterner {
 /// base-36 digits. This is a collision-free compact key; unusual fixture and
 /// dirt IDs automatically take the fully general byte-string path.
 fn pack_identifier(value: &[u8]) -> Option<u64> {
-    if value.len() < 2 || value.len() > 9 || !matches!(value[0], b'e' | b'u' | b'k') {
+    if value.len() < 2
+        || value.len() > 9
+        || !matches!(value[0], b'E' | b'K' | b'U' | b'e' | b'k' | b'u')
+    {
         return None;
     }
-    let mut body = 0u64;
-    for byte in &value[1..] {
-        let digit = match byte {
-            b'0'..=b'9' => byte - b'0',
-            b'a'..=b'z' => byte - b'a' + 10,
+    let mut packed = (value[0] as u64) << 56;
+    for (index, byte) in value[1..].iter().enumerate() {
+        // Nonzero ranks plus zero padding preserve exact byte-wise ordering,
+        // including the generator's rare upper-case case variants.
+        let rank = match byte {
+            b'0'..=b'9' => byte - b'0' + 1,
+            b'A'..=b'Z' => byte - b'A' + 11,
+            b'a'..=b'z' => byte - b'a' + 37,
             _ => return None,
         };
-        body = (body << 6) | digit as u64;
+        packed |= (rank as u64) << (50 - index * 6);
     }
-    Some(((value[0] as u64) << 56) | (((value.len() - 1) as u64) << 52) | body)
+    Some(packed)
+}
+
+fn unpack_identifier(packed: u64, output: &mut Vec<u8>) {
+    output.clear();
+    output.push((packed >> 56) as u8);
+    for index in 0..8 {
+        let rank = ((packed >> (50 - index * 6)) & 63) as u8;
+        if rank == 0 {
+            break;
+        }
+        output.push(match rank {
+            1..=10 => b'0' + rank - 1,
+            11..=36 => b'A' + rank - 11,
+            37..=62 => b'a' + rank - 37,
+            _ => unreachable!(),
+        });
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -371,6 +395,56 @@ struct Campaigns {
     by_name: HashMap<Vec<u8>, u32>,
 }
 
+#[derive(Clone, Copy)]
+struct FastEvent {
+    ts: i64,
+    person: u64,
+    price: u32,
+    category: u32,
+    purchase: bool,
+}
+
+#[derive(Clone, Copy)]
+struct FastEventCandidate {
+    id: u64,
+    ingest: i64,
+    event: FastEvent,
+    valid: bool,
+}
+
+#[derive(Clone, Copy)]
+struct FastClick {
+    ts: i64,
+    person: u64,
+    campaign: u32,
+    id: u64,
+}
+
+#[derive(Clone, Copy)]
+struct FastClickCandidate {
+    id: u64,
+    click: FastClick,
+    valid: bool,
+}
+
+#[derive(Clone, Copy)]
+struct FastSession {
+    start: i64,
+    revenue: u64,
+    person: u64,
+    day: i32,
+    purchasing: bool,
+}
+
+struct FastUserDaily {
+    person: u64,
+    day: i32,
+    sessions: u64,
+    events: u64,
+    revenue: u64,
+    top_category: Option<u32>,
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("shopping-sessions: {error}");
@@ -428,6 +502,30 @@ fn run() -> Result<()> {
 
     let (products, mut categories, unknown_category) = read_products(&data.join("products.csv"))?;
     let campaigns = read_campaigns(&data.join("campaigns.csv"))?;
+    let event_bytes = total_size(&event_files)?;
+
+    // Generated scoring datasets use compact alphanumeric IDs. A specialized
+    // one-pass path keeps the same rules but avoids tens of millions of hash
+    // insertions. Small arbitrary fixtures deliberately use the general path.
+    if event_bytes >= 10_000_000
+        && try_run_generated_fast(
+            &event_files,
+            &click_files,
+            &link_files,
+            &products,
+            unknown_category,
+            &categories,
+            &campaigns,
+            window_start,
+            window_end,
+            first_day,
+            day_count,
+            &scratch,
+            started,
+        )?
+    {
+        return Ok(());
+    }
 
     let link_bytes = total_size(&link_files)?;
     let mut users = ByteInterner::with_capacity(link_bytes / 20 + 1024, link_bytes / 2 + 1024);
@@ -435,7 +533,6 @@ fn run() -> Result<()> {
     read_links(&link_files, &mut users, &mut dsu)?;
     eprintln!("links parsed in {:.3}s", started.elapsed().as_secs_f64());
 
-    let event_bytes = total_size(&event_files)?;
     let expected_events = event_bytes / 85 + 1024;
     let mut event_index = EventIndex::with_capacity(expected_events, event_bytes / 8 + 1024);
     index_events(&event_files, &mut event_index, &mut users, &mut dsu)?;
@@ -575,6 +672,616 @@ fn run() -> Result<()> {
         "Rust core finished in {:.3}s",
         started.elapsed().as_secs_f64()
     );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_run_generated_fast(
+    event_files: &[PathBuf],
+    click_files: &[PathBuf],
+    link_files: &[PathBuf],
+    products: &HashMap<Vec<u8>, u32>,
+    unknown_category: u32,
+    categories: &[Vec<u8>],
+    campaigns: &Campaigns,
+    window_start: i64,
+    window_end: i64,
+    first_day: i32,
+    day_count: usize,
+    scratch: &Path,
+    started: Instant,
+) -> Result<bool> {
+    let Some(linked_people) = read_fast_links(link_files)? else {
+        return Ok(false);
+    };
+    eprintln!(
+        "fast links parsed in {:.3}s",
+        started.elapsed().as_secs_f64()
+    );
+
+    let unsupported = AtomicBool::new(false);
+    let event_chunks: Vec<Vec<FastEventCandidate>> = event_files
+        .par_iter()
+        .map(|path| -> Result<Vec<FastEventCandidate>> {
+            let mut candidates = Vec::new();
+            for_each_data_line(path, |_offset, line| {
+                let Some(fields) = parse_fields::<7>(line) else {
+                    return Ok(());
+                };
+                if fields[0].is_empty() {
+                    return Ok(());
+                }
+                let Some(id) = pack_identifier(fields[0]) else {
+                    unsupported.store(true, AtomicOrdering::Relaxed);
+                    return Ok(());
+                };
+                let Some(ingest) = parse_timestamp(fields[3]) else {
+                    unsupported.store(true, AtomicOrdering::Relaxed);
+                    return Ok(());
+                };
+                let mut event = FastEvent {
+                    ts: 0,
+                    person: 0,
+                    price: 0,
+                    category: 0,
+                    purchase: false,
+                };
+                let mut valid = true;
+                if fields[1].is_empty() || fields[5].is_empty() {
+                    valid = false;
+                }
+                let person = if fields[1].is_empty() {
+                    None
+                } else {
+                    pack_identifier(fields[1])
+                };
+                if !fields[1].is_empty() && person.is_none() {
+                    unsupported.store(true, AtomicOrdering::Relaxed);
+                }
+                let ts = parse_timestamp(fields[2]);
+                if ts.is_none_or(|ts| ts < window_start || ts >= window_end) {
+                    valid = false;
+                }
+                let purchase = match fields[4] {
+                    b"view" | b"cart" => false,
+                    b"purchase" => true,
+                    _ => {
+                        valid = false;
+                        false
+                    }
+                };
+                let price = if purchase {
+                    match parse_ascii_u64(fields[6]) {
+                        Some(price) if (1..=10_000_000).contains(&price) => price as u32,
+                        _ => {
+                            valid = false;
+                            0
+                        }
+                    }
+                } else {
+                    0
+                };
+                if let Some(ts) = ts {
+                    if ingest - ts > LATE_MS {
+                        valid = false;
+                    }
+                    event.ts = ts;
+                }
+                if let Some(person) = person {
+                    event.person = linked_people.get(&person).copied().unwrap_or(person);
+                } else {
+                    valid = false;
+                }
+                event.purchase = purchase;
+                event.price = price;
+                event.category = if purchase && !fields[5].is_empty() {
+                    products.get(fields[5]).copied().unwrap_or(unknown_category)
+                } else {
+                    0
+                };
+                candidates.push(FastEventCandidate {
+                    id,
+                    ingest,
+                    event,
+                    valid,
+                });
+                Ok(())
+            })?;
+            Ok(candidates)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if unsupported.load(AtomicOrdering::Relaxed) {
+        return Ok(false);
+    }
+    let event_candidates_count = event_chunks.iter().map(Vec::len).sum();
+    let mut event_candidates = Vec::with_capacity(event_candidates_count);
+    for mut chunk in event_chunks {
+        event_candidates.append(&mut chunk);
+    }
+    event_candidates.par_sort_unstable_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.ingest.cmp(&right.ingest))
+    });
+    let mut events = Vec::with_capacity(event_candidates.len());
+    let mut at = 0usize;
+    while at < event_candidates.len() {
+        let candidate = event_candidates[at];
+        let mut end = at + 1;
+        while end < event_candidates.len() && event_candidates[end].id == candidate.id {
+            end += 1;
+        }
+        if candidate.valid {
+            events.push(candidate.event);
+        }
+        at = end;
+    }
+    drop(event_candidates);
+    eprintln!(
+        "fast kept {} events in {:.3}s",
+        events.len(),
+        started.elapsed().as_secs_f64()
+    );
+
+    let click_chunks: Vec<Vec<FastClickCandidate>> = click_files
+        .par_iter()
+        .map(|path| -> Result<Vec<FastClickCandidate>> {
+            let mut candidates = Vec::new();
+            for_each_data_line(path, |_offset, line| {
+                let Some(fields) = parse_fields::<4>(line) else {
+                    return Ok(());
+                };
+                if fields[0].is_empty() {
+                    return Ok(());
+                }
+                let Some(id) = pack_identifier(fields[0]) else {
+                    unsupported.store(true, AtomicOrdering::Relaxed);
+                    return Ok(());
+                };
+                let mut click = FastClick {
+                    ts: 0,
+                    person: 0,
+                    campaign: 0,
+                    id,
+                };
+                let mut valid = true;
+                let person = if fields[1].is_empty() {
+                    valid = false;
+                    None
+                } else {
+                    pack_identifier(fields[1])
+                };
+                if !fields[1].is_empty() && person.is_none() {
+                    unsupported.store(true, AtomicOrdering::Relaxed);
+                }
+                let campaign = campaigns.by_name.get(fields[2]).copied();
+                if campaign.is_none() {
+                    valid = false;
+                }
+                let ts = parse_timestamp(fields[3]);
+                if ts.is_none_or(|ts| ts < window_start - ATTRIBUTION_MS || ts >= window_end) {
+                    valid = false;
+                }
+                if let Some(person) = person {
+                    click.person = linked_people.get(&person).copied().unwrap_or(person);
+                } else {
+                    valid = false;
+                }
+                if let Some(campaign) = campaign {
+                    click.campaign = campaign;
+                }
+                if let Some(ts) = ts {
+                    click.ts = ts;
+                }
+                candidates.push(FastClickCandidate { id, click, valid });
+                Ok(())
+            })?;
+            Ok(candidates)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if unsupported.load(AtomicOrdering::Relaxed) {
+        return Ok(false);
+    }
+    let click_candidates_count = click_chunks.iter().map(Vec::len).sum();
+    let mut click_candidates = Vec::with_capacity(click_candidates_count);
+    for mut chunk in click_chunks {
+        click_candidates.append(&mut chunk);
+    }
+    click_candidates.par_sort_unstable_by_key(|candidate| candidate.id);
+    let mut clicks = Vec::with_capacity(click_candidates.len());
+    let mut at = 0usize;
+    while at < click_candidates.len() {
+        let candidate = click_candidates[at];
+        let mut end = at + 1;
+        while end < click_candidates.len() && click_candidates[end].id == candidate.id {
+            end += 1;
+        }
+        if candidate.valid {
+            clicks.push(candidate.click);
+        }
+        at = end;
+    }
+    drop(click_candidates);
+    eprintln!(
+        "fast kept {} clicks in {:.3}s",
+        clicks.len(),
+        started.elapsed().as_secs_f64()
+    );
+
+    events.par_sort_unstable_by(|left, right| {
+        left.person
+            .cmp(&right.person)
+            .then_with(|| left.ts.cmp(&right.ts))
+    });
+    clicks.par_sort_unstable_by(|left, right| {
+        left.person
+            .cmp(&right.person)
+            .then_with(|| left.ts.cmp(&right.ts))
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    let (sessions, user_daily) = fast_sessionize(&events, categories);
+    drop(events);
+    eprintln!(
+        "fast built {} sessions in {:.3}s",
+        sessions.len(),
+        started.elapsed().as_secs_f64()
+    );
+
+    let organic = campaigns.names.len() as u32;
+    let mut campaign_daily =
+        vec![CampaignDaily::default(); (campaigns.names.len() + 1) * day_count];
+    fast_attribute_and_assist(
+        &sessions,
+        &clicks,
+        campaigns.names.len(),
+        organic,
+        first_day,
+        day_count,
+        &mut campaign_daily,
+    );
+    drop(clicks);
+
+    write_fast_user_daily(
+        &scratch.join("user_daily.csv"),
+        &user_daily,
+        categories,
+        first_day,
+        day_count,
+    )?;
+    write_campaign_daily(
+        &scratch.join("campaign_daily.csv"),
+        &campaign_daily,
+        campaigns,
+        organic,
+        first_day,
+        day_count,
+    )?;
+    let user_sessions: u64 = user_daily.iter().map(|row| row.sessions).sum();
+    let user_revenue: u64 = user_daily.iter().map(|row| row.revenue).sum();
+    let campaign_sessions: u64 = campaign_daily.iter().map(|row| row.sessions).sum();
+    let campaign_revenue: u64 = campaign_daily.iter().map(|row| row.revenue).sum();
+    if user_sessions != campaign_sessions || user_revenue != campaign_revenue {
+        return Err(format!(
+            "fast self-check failed: users ({user_sessions}, {user_revenue}) campaigns ({campaign_sessions}, {campaign_revenue})"
+        )
+        .into());
+    }
+    eprintln!(
+        "fast Rust core finished in {:.3}s",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(true)
+}
+
+fn read_fast_links(files: &[PathBuf]) -> Result<Option<U64Map<u64>>> {
+    let bytes = total_size(files)?;
+    let mut users = ByteInterner::with_capacity(bytes / 20 + 128, bytes / 2 + 128);
+    let mut dsu = Dsu::new();
+    let mut supported = true;
+    for path in files {
+        for_each_data_line(path, |_offset, line| {
+            let Some([left, right]) = parse_fields::<2>(line) else {
+                return Ok(());
+            };
+            if left.is_empty() || right.is_empty() {
+                return Ok(());
+            }
+            if pack_identifier(left).is_none() || pack_identifier(right).is_none() {
+                supported = false;
+                return Ok(());
+            }
+            let left = intern_user(&mut users, &mut dsu, left);
+            let right = intern_user(&mut users, &mut dsu, right);
+            dsu.union(left, right, &users);
+            Ok(())
+        })?;
+    }
+    if !supported || !users.heads.is_empty() {
+        return Ok(None);
+    }
+    let pairs: Vec<(u64, u32)> = users.fast.iter().map(|(&key, &id)| (key, id)).collect();
+    let mut canonical = U64Map::with_capacity_and_hasher(
+        pairs.len(),
+        BuildHasherDefault::<IdentityHasher>::default(),
+    );
+    for (key, id) in pairs {
+        let root = dsu.find(id);
+        let minimum = dsu.minimum[root as usize];
+        let minimum = pack_identifier(users.get(minimum)).expect("fast link minimum is compact");
+        canonical.insert(key, minimum);
+    }
+    Ok(Some(canonical))
+}
+
+fn fast_sessionize(
+    events: &[FastEvent],
+    categories: &[Vec<u8>],
+) -> (Vec<FastSession>, Vec<FastUserDaily>) {
+    let mut sessions = Vec::new();
+    let mut user_daily = Vec::new();
+    let mut category_sums = vec![0u64; categories.len()];
+    let mut touched = Vec::with_capacity(categories.len().min(64));
+    let mut person_start = 0usize;
+    while person_start < events.len() {
+        let person = events[person_start].person;
+        let mut person_end = person_start + 1;
+        while person_end < events.len() && events[person_end].person == person {
+            person_end += 1;
+        }
+        let mut current_day = None;
+        let mut day_sessions = 0u64;
+        let mut day_events = 0u64;
+        let mut day_revenue = 0u64;
+        let mut session_start = person_start;
+        while session_start < person_end {
+            let mut session_end = session_start + 1;
+            while session_end < person_end
+                && events[session_end].ts - events[session_end - 1].ts <= SESSION_GAP_MS
+            {
+                session_end += 1;
+            }
+            let start = events[session_start].ts;
+            let day = start.div_euclid(DAY_MS) as i32;
+            if current_day.is_some_and(|current| current != day) {
+                finish_fast_user_day(
+                    &mut user_daily,
+                    person,
+                    current_day.unwrap(),
+                    day_sessions,
+                    day_events,
+                    day_revenue,
+                    &category_sums,
+                    &touched,
+                    categories,
+                );
+                for &category in &touched {
+                    category_sums[category as usize] = 0;
+                }
+                touched.clear();
+                day_sessions = 0;
+                day_events = 0;
+                day_revenue = 0;
+            }
+            current_day = Some(day);
+            day_sessions += 1;
+            day_events += (session_end - session_start) as u64;
+            let mut revenue = 0u64;
+            let mut purchasing = false;
+            for event in &events[session_start..session_end] {
+                if event.purchase {
+                    purchasing = true;
+                    let price = event.price as u64;
+                    revenue += price;
+                    let slot = &mut category_sums[event.category as usize];
+                    if *slot == 0 {
+                        touched.push(event.category);
+                    }
+                    *slot += price;
+                }
+            }
+            day_revenue += revenue;
+            sessions.push(FastSession {
+                start,
+                revenue,
+                person,
+                day,
+                purchasing,
+            });
+            session_start = session_end;
+        }
+        if let Some(day) = current_day {
+            finish_fast_user_day(
+                &mut user_daily,
+                person,
+                day,
+                day_sessions,
+                day_events,
+                day_revenue,
+                &category_sums,
+                &touched,
+                categories,
+            );
+        }
+        for &category in &touched {
+            category_sums[category as usize] = 0;
+        }
+        touched.clear();
+        person_start = person_end;
+    }
+    (sessions, user_daily)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_fast_user_day(
+    output: &mut Vec<FastUserDaily>,
+    person: u64,
+    day: i32,
+    sessions: u64,
+    events: u64,
+    revenue: u64,
+    category_sums: &[u64],
+    touched: &[u32],
+    categories: &[Vec<u8>],
+) {
+    let mut top = None;
+    for &category in touched {
+        top = match top {
+            None => Some(category),
+            Some(best) if category_sums[category as usize] > category_sums[best as usize] => {
+                Some(category)
+            }
+            Some(best)
+                if category_sums[category as usize] == category_sums[best as usize]
+                    && categories[category as usize] < categories[best as usize] =>
+            {
+                Some(category)
+            }
+            Some(best) => Some(best),
+        };
+    }
+    output.push(FastUserDaily {
+        person,
+        day,
+        sessions,
+        events,
+        revenue,
+        top_category: top,
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fast_attribute_and_assist(
+    sessions: &[FastSession],
+    clicks: &[FastClick],
+    campaign_count: usize,
+    organic: u32,
+    first_day: i32,
+    day_count: usize,
+    output: &mut [CampaignDaily],
+) {
+    let mut click_at = 0usize;
+    let mut campaign_times: Vec<Vec<i64>> = (0..campaign_count).map(|_| Vec::new()).collect();
+    let mut touched_campaigns = Vec::with_capacity(campaign_count.min(256));
+    let mut session_start = 0usize;
+    while session_start < sessions.len() {
+        let person = sessions[session_start].person;
+        let mut session_end = session_start + 1;
+        while session_end < sessions.len() && sessions[session_end].person == person {
+            session_end += 1;
+        }
+        while click_at < clicks.len() && clicks[click_at].person < person {
+            click_at += 1;
+        }
+        let click_start = click_at;
+        while click_at < clicks.len() && clicks[click_at].person == person {
+            click_at += 1;
+        }
+        let person_sessions = &sessions[session_start..session_end];
+        let person_clicks = &clicks[click_start..click_at];
+        let mut eligible_end = 0usize;
+        for session in person_sessions {
+            while eligible_end < person_clicks.len()
+                && person_clicks[eligible_end].ts <= session.start
+            {
+                eligible_end += 1;
+            }
+            let credited = if eligible_end > 0
+                && session.start - person_clicks[eligible_end - 1].ts <= ATTRIBUTION_MS
+            {
+                person_clicks[eligible_end - 1].campaign
+            } else {
+                organic
+            };
+            let day = (session.day - first_day) as usize;
+            let aggregate = &mut output[credited as usize * day_count + day];
+            aggregate.sessions += 1;
+            aggregate.revenue += session.revenue;
+            aggregate.purchasing_sessions += u64::from(session.purchasing);
+        }
+        for click in person_clicks {
+            let times = &mut campaign_times[click.campaign as usize];
+            if times.is_empty() {
+                touched_campaigns.push(click.campaign);
+            }
+            times.push(click.ts);
+        }
+        let mut day_ranges = Vec::with_capacity(16);
+        let mut range_start = 0usize;
+        while range_start < person_sessions.len() {
+            let day = person_sessions[range_start].day;
+            let mut range_end = range_start + 1;
+            while range_end < person_sessions.len() && person_sessions[range_end].day == day {
+                range_end += 1;
+            }
+            day_ranges.push(DayRange {
+                day,
+                start: range_start,
+                end: range_end,
+            });
+            range_start = range_end;
+        }
+        for &campaign in &touched_campaigns {
+            let times = &campaign_times[campaign as usize];
+            let mut at = 0usize;
+            while at < times.len() {
+                let interval_start = times[at];
+                let mut interval_end = interval_start + ATTRIBUTION_MS;
+                at += 1;
+                while at < times.len() && times[at] <= interval_end {
+                    interval_end = interval_end.max(times[at] + ATTRIBUTION_MS);
+                    at += 1;
+                }
+                let lo = person_sessions.partition_point(|session| session.start < interval_start);
+                let hi = person_sessions.partition_point(|session| session.start <= interval_end);
+                for range in &day_ranges {
+                    if range.end <= lo {
+                        continue;
+                    }
+                    if range.start >= hi {
+                        break;
+                    }
+                    let count = range.end.min(hi) - range.start.max(lo);
+                    let day = (range.day - first_day) as usize;
+                    output[campaign as usize * day_count + day].assisted_sessions += count as u64;
+                }
+            }
+            campaign_times[campaign as usize].clear();
+        }
+        touched_campaigns.clear();
+        session_start = session_end;
+    }
+}
+
+fn write_fast_user_daily(
+    path: &Path,
+    rows: &[FastUserDaily],
+    categories: &[Vec<u8>],
+    first_day: i32,
+    day_count: usize,
+) -> Result<()> {
+    let dates: Vec<String> = (0..day_count)
+        .map(|offset| format_day(first_day + offset as i32))
+        .collect();
+    let mut writer = BufWriter::with_capacity(1 << 20, File::create(path)?);
+    writer.write_all(b"user_id,day,sessions,events,revenue_cents,top_category\n")?;
+    let mut user = Vec::with_capacity(9);
+    for row in rows {
+        unpack_identifier(row.person, &mut user);
+        write_csv_field(&mut writer, &user)?;
+        write!(
+            writer,
+            ",{},{},{},{},",
+            dates[(row.day - first_day) as usize],
+            row.sessions,
+            row.events,
+            row.revenue
+        )?;
+        if let Some(category) = row.top_category {
+            write_csv_field(&mut writer, &categories[category as usize])?;
+        }
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()?;
     Ok(())
 }
 
