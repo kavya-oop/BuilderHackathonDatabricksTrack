@@ -637,7 +637,7 @@ struct LocalIdentity {
 }
 
 impl LocalIdentity {
-    fn rebuild(&mut self, links: &[(u64, u64)]) {
+    fn rebuild(&mut self, links: &[(u64, u64)], dataset: &plan::Dataset) {
         self.ids.clear();
         self.ids.reserve(links.len() * 2);
         for &(left, right) in links {
@@ -651,7 +651,11 @@ impl LocalIdentity {
         self.size.clear();
         self.size.resize(self.ids.len(), 1);
         self.minimum.clear();
-        self.minimum.extend_from_slice(&self.ids);
+        self.minimum.extend(
+            self.ids
+                .iter()
+                .map(|&person| semantic::packed_person(dataset, person)),
+        );
         for &(left, right) in links {
             let left = self.ids.binary_search(&left).unwrap() as u32;
             let right = self.ids.binary_search(&right).unwrap() as u32;
@@ -686,9 +690,9 @@ impl LocalIdentity {
         self.minimum[a as usize] = self.minimum[a as usize].min(self.minimum[b as usize]);
     }
 
-    fn canonical(&mut self, id: u64) -> u64 {
-        let Ok(at) = self.ids.binary_search(&id) else {
-            return id;
+    fn canonical(&mut self, person: u64, dataset: &plan::Dataset) -> u64 {
+        let Ok(at) = self.ids.binary_search(&person) else {
+            return semantic::packed_person(dataset, person);
         };
         let root = self.find(at as u32);
         self.minimum[root as usize]
@@ -1090,14 +1094,11 @@ fn try_run_generator_replay(
                     return;
                 }
 
-                identity.rebuild(&shard.links);
+                identity.rebuild(&shard.links, &dataset);
                 aliases.clear();
                 for alias in 0..u64::from(user_plan.aliases.max(1)) {
-                    let id = semantic::user_id(
-                        &dataset,
-                        index as u64 * semantic::ALIAS_SLOTS + alias,
-                    );
-                    aliases.push(identity.canonical(id));
+                    let person = index as u64 * semantic::ALIAS_SLOTS + alias;
+                    aliases.push(identity.canonical(person, &dataset));
                 }
 
                 sessions.clear();
@@ -1130,7 +1131,7 @@ fn try_run_generator_replay(
                         let person = if event.person & semantic::EXCEPTIONAL_PERSON == 0 {
                             aliases[(event.person % semantic::ALIAS_SLOTS) as usize]
                         } else {
-                            identity.canonical(event.person & !semantic::EXCEPTIONAL_PERSON)
+                            identity.canonical(event.person, &dataset)
                         };
                         let category = if !event.purchase {
                             0
@@ -1171,7 +1172,7 @@ fn try_run_generator_replay(
                     } else if click.person & semantic::EXCEPTIONAL_PERSON == 0 {
                         aliases[(click.person % semantic::ALIAS_SLOTS) as usize]
                     } else {
-                        identity.canonical(click.person & !semantic::EXCEPTIONAL_PERSON)
+                        identity.canonical(click.person, &dataset)
                     };
                     clicks.push(FastClick {
                         ts: click.ts,
@@ -1184,14 +1185,14 @@ fn try_run_generator_replay(
                     clicks.sort_unstable_by(|left, right| {
                         left.ts
                             .cmp(&right.ts)
-                            .then_with(|| right.id.cmp(&left.id))
+                            .then_with(|| semantic::compare_click_ids(right.id, left.id))
                     });
                 } else {
                     clicks.sort_unstable_by(|left, right| {
                         left.person
                             .cmp(&right.person)
                             .then_with(|| left.ts.cmp(&right.ts))
-                            .then_with(|| right.id.cmp(&left.id))
+                            .then_with(|| semantic::compare_click_ids(right.id, left.id))
                     });
                 }
                 fast_attribute_and_assist_with_scratch(
@@ -1232,7 +1233,10 @@ fn try_run_generator_replay(
     if !shared_events.is_empty() || !shared_clicks.is_empty() {
         let mut dsu = PackedDsu::with_capacity(shared_links.len().saturating_mul(2));
         for &(left, right) in &shared_links {
-            dsu.union_keys(left, right);
+            dsu.union_keys(
+                semantic::packed_person(&dataset, left),
+                semantic::packed_person(&dataset, right),
+            );
         }
         let canonical = dsu.canonical_map();
         let mut events: Vec<FastEvent> = shared_events
@@ -1284,7 +1288,7 @@ fn try_run_generator_replay(
             left.person
                 .cmp(&right.person)
                 .then_with(|| left.ts.cmp(&right.ts))
-                .then_with(|| right.id.cmp(&left.id))
+                .then_with(|| semantic::compare_click_ids(right.id, left.id))
         });
         let (mut sessions, mut shared_user_daily) = fast_sessionize(&events, categories);
         session_count += sessions.len();

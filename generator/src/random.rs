@@ -12,6 +12,17 @@ pub struct Random {
     state: u64,
 }
 
+/// Integer cutoff equivalent to `draw_as_f64 < probability * 2^53`.
+pub const fn chance_threshold(probability: f64) -> u64 {
+    let scaled = probability * (1u64 << 53) as f64;
+    let floor = scaled as u64;
+    if scaled > floor as f64 {
+        floor + 1
+    } else {
+        floor
+    }
+}
+
 impl Random {
     const STEP: u64 = 0x9E37_79B9_7F4A_7C15;
 
@@ -57,6 +68,11 @@ impl Random {
         // equivalent to dividing the 53-bit draw, but avoids a floating-point
         // division on the generator's hottest path.
         ((self.next_u64() >> 11) as f64) < probability * (1u64 << 53) as f64
+    }
+
+    /// The same draw as `chance`, with a cutoff precomputed once per dataset.
+    pub fn chance_with_threshold(&mut self, threshold: u64) -> bool {
+        (self.next_u64() >> 11) < threshold
     }
 
     /// Uniform in `[low, high)`.

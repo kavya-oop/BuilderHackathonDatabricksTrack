@@ -2,7 +2,7 @@
 //! the dirt rates, the products and campaigns, and how many events, sessions
 //! and clicks each user gets.
 
-use crate::random::{Random, Stream};
+use crate::random::{chance_threshold, Random, Stream};
 use crate::text::{days_from_civil, DAY};
 
 pub const PRODUCTS: usize = 50_000;
@@ -78,6 +78,38 @@ pub struct Rates {
     pub malformed: f64,
 }
 
+pub struct RateThresholds {
+    pub event_duplicates: u64,
+    pub click_duplicates: u64,
+    pub bad_timestamp: u64,
+    pub late: u64,
+    pub bad_user: u64,
+    pub case_variant: u64,
+    pub bad_type: u64,
+    pub bad_price: u64,
+    pub unknown_product: u64,
+    pub unknown_campaign: u64,
+    pub malformed: u64,
+}
+
+impl RateThresholds {
+    fn new(rates: &Rates) -> Self {
+        Self {
+            event_duplicates: chance_threshold(rates.event_duplicates),
+            click_duplicates: chance_threshold(rates.click_duplicates),
+            bad_timestamp: chance_threshold(rates.bad_timestamp),
+            late: chance_threshold(rates.late),
+            bad_user: chance_threshold(rates.bad_user),
+            case_variant: chance_threshold(rates.case_variant),
+            bad_type: chance_threshold(rates.bad_type),
+            bad_price: chance_threshold(rates.bad_price),
+            unknown_product: chance_threshold(rates.unknown_product),
+            unknown_campaign: chance_threshold(rates.unknown_campaign),
+            malformed: chance_threshold(rates.malformed),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct UserPlan {
     pub events: u64,
@@ -98,6 +130,7 @@ pub struct Dataset {
     pub seed: u64,
     pub window_start: i64,
     pub rates: Rates,
+    pub rate_thresholds: RateThresholds,
     pub user_key: u64,
     pub event_key: u64,
     pub click_key: u64,
@@ -140,6 +173,7 @@ impl Dataset {
             quoted_field: 0.2,
             malformed: 0.000_5,
         };
+        let rate_thresholds = RateThresholds::new(&rates);
         let user_key = random.next_u64();
         let event_key = random.next_u64();
         let click_key = random.next_u64();
@@ -243,6 +277,7 @@ impl Dataset {
             seed,
             window_start,
             rates,
+            rate_thresholds,
             user_key,
             event_key,
             click_key,

@@ -2,9 +2,10 @@
 //! random stream, including CSV quoting, malformation and part-selection
 //! draws, while retaining only rows that can affect the required answer.
 
-use crate::plan::{Dataset, Rates, UserPlan, SLOTS, SLOTS_PER_DAY, WINDOW_DAYS};
-use crate::random::{Random, Stream};
+use crate::plan::{Dataset, UserPlan, SLOTS, SLOTS_PER_DAY, WINDOW_DAYS};
+use crate::random::{chance_threshold, Random, Stream};
 use crate::text::{scramble, DAY, HOUR, MINUTE, SECOND};
+use std::cmp::Ordering;
 
 pub const ALIAS_SLOTS: u64 = 512;
 /// Normal generated people are represented by their dense pre-scramble alias
@@ -30,10 +31,24 @@ const LAST_SLOT_OF_DAY: usize = SLOTS_PER_DAY - 1;
 const MOST_SESSIONS_TO_CROSS: usize = 80;
 const BAD_ORIGINAL_SHARE: f64 = 0.02;
 const ODD_PRICE_SHARE: f64 = 0.001;
-const UPPERCASE_CAMPAIGN_SHARE: f64 = 0.1;
 const EARLY_INGEST_SHARE: f64 = 0.005;
 const SAME_MILLISECOND_SHARE: f64 = 0.01;
 const CLICK_REACH: i64 = 7 * DAY;
+const FIRST_ALIAS_THRESHOLD: u64 = chance_threshold(FIRST_ALIAS_SHARE);
+const MIDNIGHT_THRESHOLD: u64 = chance_threshold(MIDNIGHT_SHARE);
+const BOUNDARY_GAP_THRESHOLD: u64 = chance_threshold(BOUNDARY_GAP_SHARE);
+const MILLISECOND_START_THRESHOLD: u64 = chance_threshold(MILLISECOND_START_SHARE);
+const ODD_PRICE_THRESHOLD: u64 = chance_threshold(ODD_PRICE_SHARE);
+const BAD_ORIGINAL_THRESHOLD: u64 = chance_threshold(BAD_ORIGINAL_SHARE);
+const TARGETED_SESSION_THRESHOLD: u64 = chance_threshold(TARGETED_SESSION_SHARE);
+const SAME_MILLISECOND_THRESHOLD: u64 = chance_threshold(SAME_MILLISECOND_SHARE);
+const WHALE_CAMPAIGN_THRESHOLD: u64 = chance_threshold(WHALE_CAMPAIGN_SHARE);
+const UNUSED_ALIAS_THRESHOLD: u64 = chance_threshold(UNUSED_ALIAS_SHARE);
+const SELF_LINK_THRESHOLD: u64 = chance_threshold(SELF_LINK_SHARE);
+const REPEATED_LINK_THRESHOLD: u64 = chance_threshold(REPEATED_LINK_SHARE);
+const HALF_THRESHOLD: u64 = chance_threshold(0.5);
+const LINK_CASE_VARIANT_THRESHOLD: u64 = chance_threshold(LINK_CASE_VARIANT);
+const EARLY_INGEST_THRESHOLD: u64 = chance_threshold(EARLY_INGEST_SHARE);
 
 #[derive(Clone, Copy)]
 pub struct SemanticEvent {
@@ -124,7 +139,6 @@ struct SemanticUser<'a> {
     plan: UserPlan,
     index: usize,
     random: Random,
-    ids: [u64; ALIAS_SLOTS as usize],
     id_count: usize,
     session_starts: [i64; SLOTS as usize],
     session_count: usize,
@@ -133,16 +147,11 @@ struct SemanticUser<'a> {
 impl<'a> SemanticUser<'a> {
     fn new(dataset: &'a Dataset, index: usize, plan: UserPlan) -> Self {
         let id_count = plan.aliases.max(1) as usize;
-        let mut ids = [0; ALIAS_SLOTS as usize];
-        for (alias, id) in ids[..id_count].iter_mut().enumerate() {
-            *id = user_id(dataset, index as u64 * ALIAS_SLOTS + alias as u64);
-        }
         Self {
             dataset,
             plan,
             index,
             random: Random::new(dataset.seed, Stream::User, index as u64),
-            ids,
             id_count,
             session_starts: [0; SLOTS as usize],
             session_count: 0,
@@ -162,18 +171,24 @@ impl<'a> SemanticUser<'a> {
     }
 
     fn alias(random: &mut Random, plan: &UserPlan, aliases: usize) -> usize {
-        if aliases == 1 || (!plan.chain && random.chance(FIRST_ALIAS_SHARE)) {
+        if aliases == 1 || (!plan.chain && random.chance_with_threshold(FIRST_ALIAS_THRESHOLD)) {
             0
         } else {
             random.below(aliases as u64) as usize
         }
     }
 
-    fn user_field(&mut self, number: u64, id: u64) -> Option<u64> {
-        if self.random.chance(self.dataset.rates.bad_user) {
+    fn user_field(&mut self, number: u64) -> Option<u64> {
+        if self
+            .random
+            .chance_with_threshold(self.dataset.rate_thresholds.bad_user)
+        {
             None
-        } else if self.random.chance(self.dataset.rates.case_variant) {
-            Some(EXCEPTIONAL_PERSON | uppercase_packed(id))
+        } else if self
+            .random
+            .chance_with_threshold(self.dataset.rate_thresholds.case_variant)
+        {
+            Some(EXCEPTIONAL_PERSON | uppercase_packed(user_id(self.dataset, number)))
         } else {
             Some(number)
         }
@@ -193,7 +208,7 @@ impl<'a> SemanticUser<'a> {
         } else {
             let may_cross = count <= MOST_SESSIONS_TO_CROSS;
             for _ in 0..count {
-                if may_cross && random.chance(MIDNIGHT_SHARE) {
+                if may_cross && random.chance_with_threshold(MIDNIGHT_THRESHOLD) {
                     let day = random.below(WINDOW_DAYS as u64 - 1) as usize;
                     let slot = day * SLOTS_PER_DAY + LAST_SLOT_OF_DAY;
                     if !used[slot] && !used[slot + 1] {
@@ -255,7 +270,7 @@ impl<'a> SemanticUser<'a> {
             if let Some(at) = shard
                 .gaps
                 .iter()
-                .position(|_| random.chance(BOUNDARY_GAP_SHARE))
+                .position(|_| random.chance_with_threshold(BOUNDARY_GAP_THRESHOLD))
             {
                 shard.gaps[at] = SESSION_GAP + random.between(0, 1);
             }
@@ -265,7 +280,7 @@ impl<'a> SemanticUser<'a> {
                 slot_start + SLOT - random.between(1, duration / SECOND) * SECOND
             } else {
                 slot_start + random.below((LATEST_START / SECOND) as u64) as i64 * SECOND
-            } + if random.chance(MILLISECOND_START_SHARE) {
+            } + if random.chance_with_threshold(MILLISECOND_START_THRESHOLD) {
                 random.between(1, 999)
             } else {
                 0
@@ -281,13 +296,14 @@ impl<'a> SemanticUser<'a> {
     }
 
     fn event(&mut self, shard: &mut Shard, index: u64, ts: i64) {
-        let rates = &self.dataset.rates;
         self.random.skip(1); // event ID case; duplicates keep the same ID
         let alias = Self::alias(&mut self.random, &self.plan, self.id_count);
         let number = self.index as u64 * ALIAS_SLOTS + alias as u64;
-        let mut person = self.user_field(number, self.ids[alias]);
+        let mut person = self.user_field(number);
 
-        let timestamp_is_bad = self.random.chance(rates.bad_timestamp);
+        let timestamp_is_bad = self
+            .random
+            .chance_with_threshold(self.dataset.rate_thresholds.bad_timestamp);
         if timestamp_is_bad {
             let outside = outside(
                 &mut self.random,
@@ -298,21 +314,38 @@ impl<'a> SemanticUser<'a> {
         } else {
             consume_valid_timestamp(&mut self.random, ts);
         }
-        let ingest_ts = ingest(&mut self.random, rates.late, ts);
+        let ingest_ts = ingest(
+            &mut self.random,
+            self.dataset.rate_thresholds.late,
+            ts,
+        );
 
         let kind = self.random.below(100);
         let purchase = kind < 3;
-        let type_valid = if self.random.chance(rates.bad_type) {
+        let type_valid = if self
+            .random
+            .chance_with_threshold(self.dataset.rate_thresholds.bad_type)
+        {
             self.random.skip(1);
             false
         } else {
             true
         };
-        let selected_product = self.dataset.product_by_rank[self
+        let selected_product = if purchase {
+            self.dataset.product_by_rank[self
+                .random
+                .by_cumulative(&self.dataset.product_rank_cumulative)]
+                as usize
+        } else {
+            // Product choice cannot affect a non-purchase row, but its draw
+            // still belongs to the deterministic stream.
+            self.random.skip(1);
+            0
+        };
+        let (product, product_present) = if self
             .random
-            .by_cumulative(&self.dataset.product_rank_cumulative)]
-            as usize;
-        let (product, product_present) = if self.random.chance(rates.unknown_product) {
+            .chance_with_threshold(self.dataset.rate_thresholds.unknown_product)
+        {
             match self.random.below(10) {
                 0 => (u32::MAX, false),
                 1 => (u32::MAX, true),
@@ -325,10 +358,13 @@ impl<'a> SemanticUser<'a> {
             (selected_product as u32, true)
         };
         let (price, price_valid) = if purchase {
-            if self.random.chance(rates.bad_price) {
+            if self
+                .random
+                .chance_with_threshold(self.dataset.rate_thresholds.bad_price)
+            {
                 let _ = self.random.below(9);
                 (0, false)
-            } else if self.random.chance(ODD_PRICE_SHARE) {
+            } else if self.random.chance_with_threshold(ODD_PRICE_THRESHOLD) {
                 let price = [10_000_000, 1, 250][self.random.below(3) as usize];
                 (price, true)
             } else {
@@ -344,13 +380,18 @@ impl<'a> SemanticUser<'a> {
         let base_valid =
             person.is_some() && !timestamp_is_bad && type_valid && product_present && price_valid;
 
-        let copies = if self.random.chance(rates.event_duplicates) {
+        let copies = if self
+            .random
+            .chance_with_threshold(self.dataset.rate_thresholds.event_duplicates)
+        {
             1 + self.random.below(3)
         } else {
             0
         };
         let special_bad_original =
-            copies > 0 && !timestamp_is_bad && self.random.chance(BAD_ORIGINAL_SHARE);
+            copies > 0
+                && !timestamp_is_bad
+                && self.random.chance_with_threshold(BAD_ORIGINAL_THRESHOLD);
         if special_bad_original {
             let outside = outside(
                 &mut self.random,
@@ -359,7 +400,11 @@ impl<'a> SemanticUser<'a> {
             );
             consume_bad_timestamp(&mut self.random, outside);
         }
-        let original_present = emit(&mut self.random, rates, &self.dataset.event_parts, 7);
+        let original_present = emit(
+            &mut self.random,
+            self.dataset.rate_thresholds.malformed,
+            7,
+        );
         let mut winner_recorded = original_present;
         if original_present && base_valid && !special_bad_original && ingest_ts - ts <= DAY {
             shard.events.push(SemanticEvent {
@@ -376,7 +421,11 @@ impl<'a> SemanticUser<'a> {
         }
         for _ in 0..copies {
             let later = ingest_ts + self.random.between(1, 600) * SECOND;
-            let present = emit(&mut self.random, rates, &self.dataset.event_parts, 7);
+            let present = emit(
+                &mut self.random,
+                self.dataset.rate_thresholds.malformed,
+                7,
+            );
             if present && !winner_recorded {
                 winner_recorded = true;
                 if base_valid && later - ts <= DAY {
@@ -398,7 +447,10 @@ impl<'a> SemanticUser<'a> {
         let mut targets = [0i64; SLOTS as usize];
         let mut target_count = 0usize;
         for &start in session_starts {
-            if self.random.chance(TARGETED_SESSION_SHARE) {
+            if self
+                .random
+                .chance_with_threshold(TARGETED_SESSION_THRESHOLD)
+            {
                 targets[target_count] = start;
                 target_count += 1;
             }
@@ -424,7 +476,8 @@ impl<'a> SemanticUser<'a> {
                 ts = start
                     - self.random.below(((start - earliest) / SECOND) as u64 + 1) as i64 * SECOND;
             }
-            let same_millisecond = end - index >= 2 && self.random.chance(SAME_MILLISECOND_SHARE);
+            let same_millisecond = end - index >= 2
+                && self.random.chance_with_threshold(SAME_MILLISECOND_THRESHOLD);
             for _ in 0..1 + u64::from(same_millisecond) {
                 self.click(shard, index, ts);
                 index += 1;
@@ -433,24 +486,26 @@ impl<'a> SemanticUser<'a> {
     }
 
     fn click(&mut self, shard: &mut Shard, index: u64, ts: i64) {
-        let rates = &self.dataset.rates;
-        let id_case_variant = self.random.chance(rates.case_variant);
-        let id = packed_id(
-            b'k',
-            scramble(index, self.dataset.click_key),
-            id_case_variant,
-        );
+        let id_case_variant = self
+            .random
+            .chance_with_threshold(self.dataset.rate_thresholds.case_variant);
+        // Preserve the scrambled value instead of formatting base-36 for every
+        // click. The high bit records the rare upper-case variant; formatting
+        // order is reconstructed only when equal timestamps need an ID tie-break.
+        let id = scramble(index, self.dataset.click_key)
+            | if id_case_variant { 1 << 63 } else { 0 };
         let alias = Self::alias(&mut self.random, &self.plan, self.id_count);
         let number = self.index as u64 * ALIAS_SLOTS + alias as u64;
-        let person = self.user_field(number, self.ids[alias]);
-        let campaign = if self.random.chance(rates.unknown_campaign) {
-            if self.random.chance(UPPERCASE_CAMPAIGN_SHARE) {
-                self.random.skip(1);
-            } else {
-                self.random.skip(1);
-            }
+        let person = self.user_field(number);
+        let campaign = if self
+            .random
+            .chance_with_threshold(self.dataset.rate_thresholds.unknown_campaign)
+        {
+            // The upper-case choice and the generated unknown name only affect
+            // bytes; unknown campaigns are discarded either way.
+            self.random.skip(2);
             None
-        } else if self.random.chance(WHALE_CAMPAIGN_SHARE) {
+        } else if self.random.chance_with_threshold(WHALE_CAMPAIGN_THRESHOLD) {
             Some(*self.random.pick(&self.dataset.whale_campaigns))
         } else {
             Some(
@@ -459,7 +514,9 @@ impl<'a> SemanticUser<'a> {
                     .by_cumulative(&self.dataset.campaign_rank_cumulative)],
             )
         };
-        let timestamp_is_bad = self.random.chance(rates.bad_timestamp);
+        let timestamp_is_bad = self
+            .random
+            .chance_with_threshold(self.dataset.rate_thresholds.bad_timestamp);
         if timestamp_is_bad {
             let outside = outside(
                 &mut self.random,
@@ -470,14 +527,21 @@ impl<'a> SemanticUser<'a> {
         } else {
             consume_valid_timestamp(&mut self.random, ts);
         }
-        let copies = if self.random.chance(rates.click_duplicates) {
+        let copies = if self
+            .random
+            .chance_with_threshold(self.dataset.rate_thresholds.click_duplicates)
+        {
             1 + self.random.below(2)
         } else {
             0
         };
         let mut winner_recorded = false;
         for _ in 0..=copies {
-            let present = emit(&mut self.random, rates, &self.dataset.click_parts, 4);
+            let present = emit(
+                &mut self.random,
+                self.dataset.rate_thresholds.malformed,
+                4,
+            );
             if present && !winner_recorded {
                 winner_recorded = true;
                 if let (Some(person), Some(campaign)) = (person, campaign) {
@@ -499,6 +563,7 @@ impl<'a> SemanticUser<'a> {
 
     fn links(&mut self, shard: &mut Shard) {
         let count = self.id_count;
+        let base = self.index as u64 * ALIAS_SLOTS;
         let mut pairs = [(0u64, 0u64); ALIAS_SLOTS as usize + 3];
         let mut pair_count = 0usize;
         if self.plan.chain {
@@ -508,35 +573,39 @@ impl<'a> SemanticUser<'a> {
             }
             self.random.shuffle(&mut order[..count]);
             for pair in order[..count].windows(2) {
-                pairs[pair_count] = (self.ids[pair[0]], self.ids[pair[1]]);
+                pairs[pair_count] = (base + pair[0] as u64, base + pair[1] as u64);
                 pair_count += 1;
             }
         } else {
             for alias in 1..count {
                 let earlier = self.random.below(alias as u64) as usize;
-                pairs[pair_count] = (self.ids[alias], self.ids[earlier]);
+                pairs[pair_count] = (base + alias as u64, base + earlier as u64);
                 pair_count += 1;
             }
         }
-        if self.random.chance(UNUSED_ALIAS_SHARE) {
-            let unused = user_id(self.dataset, self.index as u64 * ALIAS_SLOTS + count as u64);
-            pairs[pair_count] = (*self.random.pick(&self.ids[..count]), unused);
+        if self.random.chance_with_threshold(UNUSED_ALIAS_THRESHOLD) {
+            let unused = base + count as u64;
+            pairs[pair_count] = (base + self.random.below(count as u64), unused);
             pair_count += 1;
         }
         if self.plan.kiosk > 0 {
-            let kiosk = user_id(self.dataset, KIOSK_BASE + u64::from(self.plan.kiosk));
-            pairs[pair_count] = (*self.random.pick(&self.ids[..count]), kiosk);
+            let kiosk = KIOSK_BASE + u64::from(self.plan.kiosk);
+            pairs[pair_count] = (base + self.random.below(count as u64), kiosk);
             pair_count += 1;
         }
-        if self.random.chance(SELF_LINK_SHARE) {
-            let id = *self.random.pick(&self.ids[..count]);
+        if self.random.chance_with_threshold(SELF_LINK_THRESHOLD) {
+            let id = base + self.random.below(count as u64);
             pairs[pair_count] = (id, id);
             pair_count += 1;
         }
         for &(left, right) in &pairs[..pair_count] {
-            let copies = 1 + usize::from(self.random.chance(REPEATED_LINK_SHARE));
+            let copies = 1
+                + usize::from(
+                    self.random
+                        .chance_with_threshold(REPEATED_LINK_THRESHOLD),
+                );
             for _ in 0..copies {
-                let (first, second) = if self.random.chance(0.5) {
+                let (first, second) = if self.random.chance_with_threshold(HALF_THRESHOLD) {
                     (left, right)
                 } else {
                     (right, left)
@@ -545,8 +614,7 @@ impl<'a> SemanticUser<'a> {
                 let second = self.link_field(second);
                 if emit(
                     &mut self.random,
-                    &self.dataset.rates,
-                    &self.dataset.link_parts,
+                    self.dataset.rate_thresholds.malformed,
                     2,
                 ) {
                     if let (Some(first), Some(second)) = (first, second) {
@@ -557,19 +625,65 @@ impl<'a> SemanticUser<'a> {
         }
     }
 
-    fn link_field(&mut self, id: u64) -> Option<u64> {
-        if self.random.chance(self.dataset.rates.bad_user) {
+    fn link_field(&mut self, number: u64) -> Option<u64> {
+        if self
+            .random
+            .chance_with_threshold(self.dataset.rate_thresholds.bad_user)
+        {
             None
-        } else if self.random.chance(LINK_CASE_VARIANT) {
-            Some(uppercase_packed(id))
+        } else if self
+            .random
+            .chance_with_threshold(LINK_CASE_VARIANT_THRESHOLD)
+        {
+            Some(EXCEPTIONAL_PERSON | uppercase_packed(user_id(self.dataset, number)))
         } else {
-            Some(id)
+            Some(number)
         }
     }
 }
 
 pub fn user_id(dataset: &Dataset, number: u64) -> u64 {
     packed_id(b'u', scramble(number, dataset.user_key), false)
+}
+
+/// Convert the dense/exceptional person representation used by semantic replay
+/// to the packed ASCII ordering used by output and canonical-ID selection.
+pub fn packed_person(dataset: &Dataset, person: u64) -> u64 {
+    if person & EXCEPTIONAL_PERSON == 0 {
+        user_id(dataset, person)
+    } else {
+        person & !EXCEPTIONAL_PERSON
+    }
+}
+
+/// Compare semantic click IDs in their emitted ASCII order without eagerly
+/// building the `k<base36>` byte string for every generated click.
+pub fn compare_click_ids(left: u64, right: u64) -> Ordering {
+    let left_upper = left >> 63;
+    let right_upper = right >> 63;
+    match (left_upper, right_upper) {
+        (1, 0) => return Ordering::Less,
+        (0, 1) => return Ordering::Greater,
+        _ => {}
+    }
+
+    fn digits(mut value: u64, out: &mut [u8; 8]) -> usize {
+        let mut at = out.len();
+        loop {
+            at -= 1;
+            out[at] = (value % 36) as u8;
+            value /= 36;
+            if value == 0 {
+                return at;
+            }
+        }
+    }
+
+    let mut left_digits = [0u8; 8];
+    let mut right_digits = [0u8; 8];
+    let left_at = digits(left & ((1 << 40) - 1), &mut left_digits);
+    let right_at = digits(right & ((1 << 40) - 1), &mut right_digits);
+    left_digits[left_at..].cmp(&right_digits[right_at..])
 }
 
 fn packed_id(prefix: u8, value: u64, uppercase: bool) -> u64 {
@@ -643,28 +757,28 @@ fn outside(random: &mut Random, window_start: i64, window_end: i64) -> i64 {
     }
 }
 
-fn ingest(random: &mut Random, late: f64, ts: i64) -> i64 {
+fn ingest(random: &mut Random, late_threshold: u64, ts: i64) -> i64 {
     let floor = ts - ts.rem_euclid(SECOND);
     let ceiling = if floor == ts { ts } else { floor + SECOND };
-    if random.chance(late) {
+    if random.chance_with_threshold(late_threshold) {
         match random.below(10) {
             0 if floor == ts => ts + DAY,
             1 if floor == ts => ts + DAY + SECOND,
             _ => ceiling + random.between(DAY / SECOND + 1, 5 * DAY / SECOND) * SECOND,
         }
-    } else if random.chance(EARLY_INGEST_SHARE) {
+    } else if random.chance_with_threshold(EARLY_INGEST_THRESHOLD) {
         floor - random.between(1, 5) * SECOND
     } else {
         ceiling + random.between(0, 600) * SECOND
     }
 }
 
-fn emit(random: &mut Random, rates: &Rates, _shares: &[f64], fields: usize) -> bool {
+fn emit(random: &mut Random, malformed_threshold: u64, fields: usize) -> bool {
     // Quoting and the chosen output part affect bytes only. Advance the
     // SplitMix counter without evaluating those discarded random values.
     random.skip(fields);
     let mut present = true;
-    if random.chance(rates.malformed) {
+    if random.chance_with_threshold(malformed_threshold) {
         let fault = random.below(6);
         present = fault == 5;
         if fault == 5 {
