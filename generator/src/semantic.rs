@@ -320,8 +320,7 @@ impl<'a> SemanticUser<'a> {
             ts,
         );
 
-        let kind = self.random.below(100);
-        let purchase = kind < 3;
+        let purchase = self.random.below_lt(100, 3);
         let type_valid = if self
             .random
             .chance_with_threshold(self.dataset.rate_thresholds.bad_type)
@@ -362,7 +361,7 @@ impl<'a> SemanticUser<'a> {
                 .random
                 .chance_with_threshold(self.dataset.rate_thresholds.bad_price)
             {
-                let _ = self.random.below(9);
+                self.random.skip(1);
                 (0, false)
             } else if self.random.chance_with_threshold(ODD_PRICE_THRESHOLD) {
                 let price = [10_000_000, 1, 250][self.random.below(3) as usize];
@@ -371,8 +370,7 @@ impl<'a> SemanticUser<'a> {
                 (self.dataset.product_price[selected_product] as u32, true)
             }
         } else {
-            let draw = self.random.below(20);
-            if draw >= 19 {
+            if !self.random.below_lt(20, 19) {
                 self.random.skip(1);
             }
             (0, true)
@@ -465,13 +463,19 @@ impl<'a> SemanticUser<'a> {
         let end = index + self.plan.clicks;
         while index < end {
             let start = *self.random.pick(&targets[..target_count]);
-            let delta = match self.random.below(1000) {
-                0..4 => CLICK_REACH,
-                4..8 => CLICK_REACH + 1,
-                8..12 => 0,
-                12..16 => -1,
-                16..750 => (self.random.spread(19) * SECOND).min(CLICK_REACH),
-                _ => CLICK_REACH + self.random.between(1, 3 * DAY / SECOND) * SECOND,
+            let delta_draw = self.random.next_u64();
+            let delta = if Random::bucket_lt(delta_draw, 1000, 4) {
+                CLICK_REACH
+            } else if Random::bucket_lt(delta_draw, 1000, 8) {
+                CLICK_REACH + 1
+            } else if Random::bucket_lt(delta_draw, 1000, 12) {
+                0
+            } else if Random::bucket_lt(delta_draw, 1000, 16) {
+                -1
+            } else if Random::bucket_lt(delta_draw, 1000, 750) {
+                (self.random.spread(19) * SECOND).min(CLICK_REACH)
+            } else {
+                CLICK_REACH + self.random.between(1, 3 * DAY / SECOND) * SECOND
             };
             let mut ts = start - delta;
             if ts < earliest {
@@ -733,8 +737,11 @@ fn uppercase_packed(packed: u64) -> u64 {
 }
 
 fn consume_valid_timestamp(random: &mut Random, milliseconds: i64) {
-    let draw = random.below(10);
-    if milliseconds % SECOND == 0 && draw == 6 {
+    let draw = random.next_u64();
+    if milliseconds % SECOND == 0
+        && !Random::bucket_lt(draw, 10, 6)
+        && Random::bucket_lt(draw, 10, 7)
+    {
         random.skip(1);
     }
 }
@@ -762,14 +769,15 @@ fn outside(random: &mut Random, window_start: i64, window_end: i64) -> i64 {
 fn ingest_validity(random: &mut Random, late_threshold: u64, ts: i64) -> (bool, bool) {
     let floor = ts - ts.rem_euclid(SECOND);
     if random.chance_with_threshold(late_threshold) {
-        match random.below(10) {
+        let branch = random.next_u64();
+        if floor == ts && Random::bucket_lt(branch, 10, 1) {
             // Exactly one day late admits the original but not a later copy.
-            0 if floor == ts => (true, false),
-            1 if floor == ts => (false, false),
-            _ => {
-                random.skip(1);
-                (false, false)
-            }
+            (true, false)
+        } else if floor == ts && Random::bucket_lt(branch, 10, 2) {
+            (false, false)
+        } else {
+            random.skip(1);
+            (false, false)
         }
     } else if random.chance_with_threshold(EARLY_INGEST_THRESHOLD) {
         random.skip(1);

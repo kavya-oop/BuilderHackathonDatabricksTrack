@@ -33,6 +33,7 @@ impl Random {
         Self { state }
     }
 
+    #[inline(always)]
     pub fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(Self::STEP);
         mix(self.state)
@@ -51,6 +52,26 @@ impl Random {
     /// step: a bias of at most `bound / 2^64` does not matter here).
     pub fn below(&mut self, bound: u64) -> u64 {
         ((u128::from(self.next_u64()) * u128::from(bound)) >> 64) as u64
+    }
+
+    /// Whether Lemire's `0..bound` bucket for `draw` is below `cutoff`,
+    /// without calculating the bucket itself.
+    #[inline(always)]
+    pub const fn bucket_lt(draw: u64, bound: u64, cutoff: u64) -> bool {
+        if cutoff == 0 {
+            false
+        } else if cutoff >= bound {
+            true
+        } else {
+            let numerator = (cutoff as u128) << 64;
+            let threshold = (numerator + bound as u128 - 1) / bound as u128;
+            (draw as u128) < threshold
+        }
+    }
+
+    #[inline(always)]
+    pub fn below_lt(&mut self, bound: u64, cutoff: u64) -> bool {
+        Self::bucket_lt(self.next_u64(), bound, cutoff)
     }
 
     /// Uniform in `low..=high`.
