@@ -1,0 +1,16 @@
+.DS_Store
+.idea/
+.vscode/
+target/
+.tools/
+dev/
+bench*/
+dev-answer/
+generator/
+starter-duckdb/
+starter-polars/
+starter-pyspark/
+output/
+scratch/
+*.log
+__pycache__/

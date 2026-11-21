@@ -1,0 +1,15 @@
+.git
+.github
+.DS_Store
+.tools
+target
+dev
+dev-answer
+bench*
+generator
+starter-duckdb
+starter-polars
+starter-pyspark
+output
+scratch
+*.log
