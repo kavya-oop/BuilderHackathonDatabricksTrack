@@ -13,7 +13,7 @@ use std::env;
 use std::error::Error;
 use std::fs::{self, File};
 use std::hash::{BuildHasherDefault, Hasher};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
@@ -1378,15 +1378,23 @@ fn try_run_generator_replay(
         .fold((0u64, 0u64), |(sessions, revenue), partial| {
             (sessions + partial.0, revenue + partial.1)
         });
-    write_fast_user_daily_parts(&output.join("user_daily"), user_daily_parts, categories)?;
-    write_campaign_daily(
-        &output.join("campaign_daily/part-0.parquet"),
-        &campaign_daily,
-        campaigns,
-        organic,
-        first_day,
-        day_count,
-    )?;
+    let user_folder = output.join("user_daily");
+    let campaign_path = output.join("campaign_daily/part-0.parquet");
+    let (user_write, campaign_write) = rayon::join(
+        || write_fast_user_daily_parts(&user_folder, user_daily_parts, categories),
+        || {
+            write_campaign_daily(
+                &campaign_path,
+                &campaign_daily,
+                campaigns,
+                organic,
+                first_day,
+                day_count,
+            )
+        },
+    );
+    user_write?;
+    campaign_write?;
     eprintln!(
         "replay parquet output complete in {:.3}s",
         started.elapsed().as_secs_f64()
@@ -2279,21 +2287,16 @@ fn write_fast_user_daily_part(
         revenue,
         top_categories,
     } = rows;
-    let mut user_keys = Vec::with_capacity(row_count);
-    let mut user_values =
-        MutableUtf8Array::<i32>::with_capacities(row_count / 3, row_count * 3);
+    let mut user_ids = MutableUtf8Array::<i32>::with_capacities(row_count, row_count * 8);
     let mut top_keys = MutablePrimitiveArray::<i32>::with_capacity(row_count);
     let mut user = Vec::with_capacity(9);
     let mut last_person = None;
-    let mut user_key = -1i32;
     for person in persons {
         if last_person != Some(person) {
             unpack_identifier(person, &mut user);
-            user_values.push(Some(std::str::from_utf8(&user)?));
-            user_key += 1;
             last_person = Some(person);
         }
-        user_keys.push(user_key);
+        user_ids.push(Some(std::str::from_utf8(&user)?));
     }
     for category in top_categories {
         if category != NONE {
@@ -2303,11 +2306,6 @@ fn write_fast_user_daily_part(
         }
     }
     let dictionary_utf8 = DataType::Dictionary(IntegerType::Int32, Box::new(DataType::Utf8), false);
-    let user_ids = DictionaryArray::<i32>::try_new(
-        dictionary_utf8.clone(),
-        PrimitiveArray::<i32>::from_vec(user_keys),
-        Into::<Utf8Array<i32>>::into(user_values).boxed(),
-    )?;
     let category_values = Utf8Array::<i32>::from_slice(
         categories
             .iter()
@@ -2320,7 +2318,7 @@ fn write_fast_user_daily_part(
         category_values.boxed(),
     )?;
     let schema = Schema::from(vec![
-        Field::new("user_id", dictionary_utf8.clone(), false),
+        Field::new("user_id", DataType::Utf8, false),
         Field::new("day", DataType::Date32, false),
         Field::new("sessions", DataType::Int64, false),
         Field::new("events", DataType::Int64, false),
@@ -2331,7 +2329,7 @@ fn write_fast_user_daily_part(
         path,
         schema,
         vec![
-            user_ids.boxed(),
+            Into::<Utf8Array<i32>>::into(user_ids).boxed(),
             PrimitiveArray::<i32>::from_vec(days)
                 .to(DataType::Date32)
                 .boxed(),
@@ -2371,7 +2369,8 @@ fn write_parquet(path: &Path, schema: Schema, arrays: Vec<Box<dyn Array>>) -> Re
         options,
         encodings,
     )?;
-    let mut writer = FileWriter::try_new(File::create(path)?, schema, options)?;
+    let file = BufWriter::with_capacity(256 * 1024, File::create(path)?);
+    let mut writer = FileWriter::try_new(file, schema, options)?;
     for group in row_groups {
         writer.write(group?)?;
     }
