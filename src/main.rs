@@ -2357,7 +2357,7 @@ fn write_parquet(path: &Path, schema: Schema, arrays: Vec<Box<dyn Array>>) -> Re
         .map(|field| match field.data_type() {
             DataType::Dictionary(_, _, _) => vec![Encoding::RleDictionary],
             DataType::Int32 | DataType::Int64 | DataType::Date32 => {
-                vec![Encoding::Plain]
+                vec![Encoding::DeltaBinaryPacked]
             }
             _ => vec![Encoding::Plain],
         })
