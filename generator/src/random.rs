@@ -13,6 +13,8 @@ pub struct Random {
 }
 
 impl Random {
+    const STEP: u64 = 0x9E37_79B9_7F4A_7C15;
+
     pub fn new(seed: u64, stream: Stream, index: u64) -> Self {
         let state = mix(mix(seed ^ 0x5D58_8B65_6C07_8965)
             ^ mix(stream as u64 + 1)
@@ -21,8 +23,17 @@ impl Random {
     }
 
     pub fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        self.state = self.state.wrapping_add(Self::STEP);
         mix(self.state)
+    }
+
+    /// Consume draws whose values cannot affect semantic output. SplitMix is
+    /// counter-based, so advancing the state is identical to generating and
+    /// discarding every intermediate value.
+    pub fn skip(&mut self, draws: usize) {
+        self.state = self
+            .state
+            .wrapping_add(Self::STEP.wrapping_mul(draws as u64));
     }
 
     /// Uniform in `0..bound` (Lemire's multiply-shift, without the rejection
@@ -42,7 +53,10 @@ impl Random {
     }
 
     pub fn chance(&mut self, probability: f64) -> bool {
-        self.unit() < probability
+        // Scaling the probability by the same power of two is exactly
+        // equivalent to dividing the 53-bit draw, but avoids a floating-point
+        // division on the generator's hottest path.
+        ((self.next_u64() >> 11) as f64) < probability * (1u64 << 53) as f64
     }
 
     /// Uniform in `[low, high)`.

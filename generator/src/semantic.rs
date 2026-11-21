@@ -2,9 +2,7 @@
 //! random stream, including CSV quoting, malformation and part-selection
 //! draws, while retaining only rows that can affect the required answer.
 
-use crate::plan::{
-    Dataset, Rates, UserPlan, CAMPAIGNS, PRODUCTS, SLOTS, SLOTS_PER_DAY, WINDOW_DAYS,
-};
+use crate::plan::{Dataset, Rates, UserPlan, SLOTS, SLOTS_PER_DAY, WINDOW_DAYS};
 use crate::random::{Random, Stream};
 use crate::text::{scramble, DAY, HOUR, MINUTE, SECOND};
 
@@ -58,6 +56,26 @@ pub struct Shard {
     pub events: Vec<SemanticEvent>,
     pub clicks: Vec<SemanticClick>,
     pub links: Vec<(u64, u64)>,
+    event_times: Vec<i64>,
+    gaps: Vec<i64>,
+}
+
+impl Shard {
+    fn new(event_capacity: usize, click_capacity: usize) -> Self {
+        Self {
+            events: Vec::with_capacity(event_capacity),
+            clicks: Vec::with_capacity(click_capacity),
+            links: Vec::new(),
+            event_times: Vec::new(),
+            gaps: Vec::new(),
+        }
+    }
+
+    fn start_user(&mut self) {
+        self.events.clear();
+        self.clicks.clear();
+        self.links.clear();
+    }
 }
 
 /// Replays one generator shard while exposing each completed user's compact
@@ -70,21 +88,15 @@ pub fn generate_shard_with<F>(
 ) where
     F: FnMut(usize, UserPlan, &mut Shard),
 {
-    let mut shard = Shard {
-        events: Vec::new(),
-        clicks: Vec::new(),
-        links: Vec::new(),
-    };
+    let mut shard = Shard::new(0, 0);
     for index in users {
         let plan = dataset.users[index];
         if plan.events == 0 {
             continue;
         }
+        shard.start_user();
         SemanticUser::new(dataset, index, plan).generate(&mut shard);
         consume(index, plan, &mut shard);
-        shard.events.clear();
-        shard.clicks.clear();
-        shard.links.clear();
     }
 }
 
@@ -97,11 +109,7 @@ pub fn generate_shard(dataset: &Dataset, users: std::ops::Range<usize>) -> Shard
         .clone()
         .map(|index| dataset.users[index].clicks as usize)
         .sum();
-    let mut shard = Shard {
-        events: Vec::with_capacity(event_capacity),
-        clicks: Vec::with_capacity(click_capacity),
-        links: Vec::new(),
-    };
+    let mut shard = Shard::new(event_capacity, click_capacity);
     for index in users {
         let plan = dataset.users[index];
         if plan.events > 0 {
@@ -116,34 +124,40 @@ struct SemanticUser<'a> {
     plan: UserPlan,
     index: usize,
     random: Random,
-    ids: Vec<u64>,
+    ids: [u64; ALIAS_SLOTS as usize],
+    id_count: usize,
+    session_starts: [i64; SLOTS as usize],
+    session_count: usize,
 }
 
 impl<'a> SemanticUser<'a> {
     fn new(dataset: &'a Dataset, index: usize, plan: UserPlan) -> Self {
-        let ids = (0..u64::from(plan.aliases.max(1)))
-            .map(|alias| user_id(dataset, index as u64 * ALIAS_SLOTS + alias))
-            .collect();
+        let id_count = plan.aliases.max(1) as usize;
+        let mut ids = [0; ALIAS_SLOTS as usize];
+        for (alias, id) in ids[..id_count].iter_mut().enumerate() {
+            *id = user_id(dataset, index as u64 * ALIAS_SLOTS + alias as u64);
+        }
         Self {
             dataset,
             plan,
             index,
             random: Random::new(dataset.seed, Stream::User, index as u64),
             ids,
+            id_count,
+            session_starts: [0; SLOTS as usize],
+            session_count: 0,
         }
     }
 
     fn generate(&mut self, shard: &mut Shard) {
-        let sessions = self.layout();
+        self.layout(shard);
         let mut event_index = self.plan.first_event;
-        for session in &sessions {
-            for &ts in session {
-                self.event(shard, event_index, ts);
-                event_index += 1;
-            }
+        for at in 0..shard.event_times.len() {
+            let ts = shard.event_times[at];
+            self.event(shard, event_index, ts);
+            event_index += 1;
         }
-        let starts: Vec<i64> = sessions.iter().map(|session| session[0]).collect();
-        self.clicks(shard, &starts);
+        self.clicks(shard);
         self.links(shard);
     }
 
@@ -165,13 +179,17 @@ impl<'a> SemanticUser<'a> {
         }
     }
 
-    fn layout(&mut self) -> Vec<Vec<i64>> {
+    fn layout(&mut self, shard: &mut Shard) {
         let random = &mut self.random;
         let count = self.plan.sessions as usize;
         let mut used = [false; SLOTS as usize];
-        let mut slots: Vec<(usize, bool)> = Vec::with_capacity(count);
+        let mut slots = [(0usize, false); SLOTS as usize];
+        let mut slot_count = 0usize;
         if count == SLOTS as usize {
-            slots.extend((0..count).map(|slot| (slot, false)));
+            for (slot, target) in slots[..count].iter_mut().enumerate() {
+                *target = (slot, false);
+            }
+            slot_count = count;
         } else {
             let may_cross = count <= MOST_SESSIONS_TO_CROSS;
             for _ in 0..count {
@@ -181,7 +199,8 @@ impl<'a> SemanticUser<'a> {
                     if !used[slot] && !used[slot + 1] {
                         used[slot] = true;
                         used[slot + 1] = true;
-                        slots.push((slot, true));
+                        slots[slot_count] = (slot, true);
+                        slot_count += 1;
                         continue;
                     }
                 }
@@ -189,68 +208,82 @@ impl<'a> SemanticUser<'a> {
                     let slot = random.below(u64::from(SLOTS)) as usize;
                     if !used[slot] {
                         used[slot] = true;
-                        slots.push((slot, false));
+                        slots[slot_count] = (slot, false);
+                        slot_count += 1;
                         break;
                     }
                 }
             }
-            slots.sort_unstable();
+            slots[..slot_count].sort_unstable();
         }
 
-        let mut sizes = vec![1u64; count];
-        let weights: Vec<u64> = (0..count).map(|_| 1 + random.below(4)).collect();
-        let weight_total: u64 = weights.iter().sum();
+        let mut sizes = [0u64; SLOTS as usize];
+        for size in &mut sizes[..count] {
+            *size = 1 + random.below(4);
+        }
+        let weight_total: u64 = sizes[..count].iter().sum();
         let extra = self.plan.events - count as u64;
         let mut given = 0;
         let mut running = 0;
-        for (size, weight) in sizes.iter_mut().zip(&weights) {
+        for size in &mut sizes[..count] {
+            let weight = *size;
             running += weight;
             let through = extra * running / weight_total;
-            *size += through - given;
+            *size = 1 + through - given;
             given = through;
         }
 
-        slots
+        shard.event_times.clear();
+        shard.event_times.reserve(self.plan.events as usize);
+        self.session_count = count;
+        for (session_index, (&(slot, crossing), &size)) in slots[..slot_count]
             .iter()
-            .zip(sizes)
-            .map(|(&(slot, crossing), size)| {
-                let mut gaps: Vec<i64> = (1..size).map(|_| random.spread(10) * SECOND).collect();
-                let natural: i64 = gaps.iter().sum();
-                if natural > LONGEST_SESSION {
-                    for gap in &mut gaps {
-                        *gap = *gap * LONGEST_SESSION / natural / SECOND * SECOND;
-                    }
+            .zip(&sizes[..count])
+            .enumerate()
+        {
+            shard.gaps.clear();
+            shard.gaps.reserve(size.saturating_sub(1) as usize);
+            shard
+                .gaps
+                .extend((1..size).map(|_| random.spread(10) * SECOND));
+            let natural: i64 = shard.gaps.iter().sum();
+            if natural > LONGEST_SESSION {
+                for gap in &mut shard.gaps {
+                    *gap = *gap * LONGEST_SESSION / natural / SECOND * SECOND;
                 }
-                if let Some(at) = gaps.iter().position(|_| random.chance(BOUNDARY_GAP_SHARE)) {
-                    gaps[at] = SESSION_GAP + random.between(0, 1);
-                }
-                let duration: i64 = gaps.iter().sum();
-                let slot_start = self.dataset.window_start + slot as i64 * SLOT;
-                let start = if crossing && duration >= 2 * SECOND {
-                    slot_start + SLOT - random.between(1, duration / SECOND) * SECOND
-                } else {
-                    slot_start + random.below((LATEST_START / SECOND) as u64) as i64 * SECOND
-                } + if random.chance(MILLISECOND_START_SHARE) {
-                    random.between(1, 999)
-                } else {
-                    0
-                };
-                let mut ts = start;
-                let mut times = Vec::with_capacity(size as usize);
-                times.push(ts);
-                for gap in gaps {
-                    ts += gap;
-                    times.push(ts);
-                }
-                times
-            })
-            .collect()
+            }
+            if let Some(at) = shard
+                .gaps
+                .iter()
+                .position(|_| random.chance(BOUNDARY_GAP_SHARE))
+            {
+                shard.gaps[at] = SESSION_GAP + random.between(0, 1);
+            }
+            let duration: i64 = shard.gaps.iter().sum();
+            let slot_start = self.dataset.window_start + slot as i64 * SLOT;
+            let start = if crossing && duration >= 2 * SECOND {
+                slot_start + SLOT - random.between(1, duration / SECOND) * SECOND
+            } else {
+                slot_start + random.below((LATEST_START / SECOND) as u64) as i64 * SECOND
+            } + if random.chance(MILLISECOND_START_SHARE) {
+                random.between(1, 999)
+            } else {
+                0
+            };
+            self.session_starts[session_index] = start;
+            let mut ts = start;
+            shard.event_times.push(ts);
+            for &gap in &shard.gaps {
+                ts += gap;
+                shard.event_times.push(ts);
+            }
+        }
     }
 
     fn event(&mut self, shard: &mut Shard, index: u64, ts: i64) {
         let rates = &self.dataset.rates;
-        let _event_id_case_variant = self.random.chance(rates.case_variant);
-        let alias = Self::alias(&mut self.random, &self.plan, self.ids.len());
+        self.random.skip(1); // event ID case; duplicates keep the same ID
+        let alias = Self::alias(&mut self.random, &self.plan, self.id_count);
         let number = self.index as u64 * ALIAS_SLOTS + alias as u64;
         let mut person = self.user_field(number, self.ids[alias]);
 
@@ -270,7 +303,7 @@ impl<'a> SemanticUser<'a> {
         let kind = self.random.below(100);
         let purchase = kind < 3;
         let type_valid = if self.random.chance(rates.bad_type) {
-            let _ = self.random.below(8);
+            self.random.skip(1);
             false
         } else {
             true
@@ -284,7 +317,7 @@ impl<'a> SemanticUser<'a> {
                 0 => (u32::MAX, false),
                 1 => (u32::MAX, true),
                 _ => {
-                    let _ = self.random.between(PRODUCTS as i64 + 1, 99_999);
+                    self.random.skip(1);
                     (u32::MAX, true)
                 }
             }
@@ -304,7 +337,7 @@ impl<'a> SemanticUser<'a> {
         } else {
             let draw = self.random.below(20);
             if draw >= 19 {
-                let _ = self.random.below(9);
+                self.random.skip(1);
             }
             (0, true)
         };
@@ -359,20 +392,25 @@ impl<'a> SemanticUser<'a> {
         }
     }
 
-    fn clicks(&mut self, shard: &mut Shard, session_starts: &[i64]) {
+    fn clicks(&mut self, shard: &mut Shard) {
         let earliest = self.dataset.window_start - CLICK_REACH;
-        let mut targets: Vec<i64> = session_starts
-            .iter()
-            .copied()
-            .filter(|_| self.random.chance(TARGETED_SESSION_SHARE))
-            .collect();
-        if targets.is_empty() {
-            targets.push(*self.random.pick(session_starts));
+        let session_starts = &self.session_starts[..self.session_count];
+        let mut targets = [0i64; SLOTS as usize];
+        let mut target_count = 0usize;
+        for &start in session_starts {
+            if self.random.chance(TARGETED_SESSION_SHARE) {
+                targets[target_count] = start;
+                target_count += 1;
+            }
+        }
+        if target_count == 0 {
+            targets[0] = *self.random.pick(session_starts);
+            target_count = 1;
         }
         let mut index = self.plan.first_click;
         let end = index + self.plan.clicks;
         while index < end {
-            let start = *self.random.pick(&targets);
+            let start = *self.random.pick(&targets[..target_count]);
             let delta = match self.random.below(1000) {
                 0..4 => CLICK_REACH,
                 4..8 => CLICK_REACH + 1,
@@ -402,14 +440,14 @@ impl<'a> SemanticUser<'a> {
             scramble(index, self.dataset.click_key),
             id_case_variant,
         );
-        let alias = Self::alias(&mut self.random, &self.plan, self.ids.len());
+        let alias = Self::alias(&mut self.random, &self.plan, self.id_count);
         let number = self.index as u64 * ALIAS_SLOTS + alias as u64;
         let person = self.user_field(number, self.ids[alias]);
         let campaign = if self.random.chance(rates.unknown_campaign) {
             if self.random.chance(UPPERCASE_CAMPAIGN_SHARE) {
-                let _ = self.random.between(1, CAMPAIGNS as i64);
+                self.random.skip(1);
             } else {
-                let _ = self.random.between(CAMPAIGNS as i64 + 1, 9_999);
+                self.random.skip(1);
             }
             None
         } else if self.random.chance(WHALE_CAMPAIGN_SHARE) {
@@ -460,33 +498,42 @@ impl<'a> SemanticUser<'a> {
     }
 
     fn links(&mut self, shard: &mut Shard) {
-        let count = self.ids.len();
-        let mut pairs = Vec::new();
+        let count = self.id_count;
+        let mut pairs = [(0u64, 0u64); ALIAS_SLOTS as usize + 3];
+        let mut pair_count = 0usize;
         if self.plan.chain {
-            let mut order: Vec<usize> = (0..count).collect();
-            self.random.shuffle(&mut order);
-            for pair in order.windows(2) {
-                pairs.push((self.ids[pair[0]], self.ids[pair[1]]));
+            let mut order = [0usize; ALIAS_SLOTS as usize];
+            for (index, target) in order[..count].iter_mut().enumerate() {
+                *target = index;
+            }
+            self.random.shuffle(&mut order[..count]);
+            for pair in order[..count].windows(2) {
+                pairs[pair_count] = (self.ids[pair[0]], self.ids[pair[1]]);
+                pair_count += 1;
             }
         } else {
             for alias in 1..count {
                 let earlier = self.random.below(alias as u64) as usize;
-                pairs.push((self.ids[alias], self.ids[earlier]));
+                pairs[pair_count] = (self.ids[alias], self.ids[earlier]);
+                pair_count += 1;
             }
         }
         if self.random.chance(UNUSED_ALIAS_SHARE) {
             let unused = user_id(self.dataset, self.index as u64 * ALIAS_SLOTS + count as u64);
-            pairs.push((*self.random.pick(&self.ids), unused));
+            pairs[pair_count] = (*self.random.pick(&self.ids[..count]), unused);
+            pair_count += 1;
         }
         if self.plan.kiosk > 0 {
             let kiosk = user_id(self.dataset, KIOSK_BASE + u64::from(self.plan.kiosk));
-            pairs.push((*self.random.pick(&self.ids), kiosk));
+            pairs[pair_count] = (*self.random.pick(&self.ids[..count]), kiosk);
+            pair_count += 1;
         }
         if self.random.chance(SELF_LINK_SHARE) {
-            let id = *self.random.pick(&self.ids);
-            pairs.push((id, id));
+            let id = *self.random.pick(&self.ids[..count]);
+            pairs[pair_count] = (id, id);
+            pair_count += 1;
         }
-        for (left, right) in pairs {
+        for &(left, right) in &pairs[..pair_count] {
             let copies = 1 + usize::from(self.random.chance(REPEATED_LINK_SHARE));
             for _ in 0..copies {
                 let (first, second) = if self.random.chance(0.5) {
@@ -572,14 +619,14 @@ fn uppercase_packed(packed: u64) -> u64 {
 fn consume_valid_timestamp(random: &mut Random, milliseconds: i64) {
     let draw = random.below(10);
     if milliseconds % SECOND == 0 && draw == 6 {
-        let _ = random.below(31);
+        random.skip(1);
     }
 }
 
 fn consume_bad_timestamp(random: &mut Random, outside: i64) {
     match random.below(15) {
         7 => {
-            let _ = random.between(1, 9);
+            random.skip(1);
         }
         14 => consume_valid_timestamp(random, outside),
         _ => {}
@@ -612,18 +659,18 @@ fn ingest(random: &mut Random, late: f64, ts: i64) -> i64 {
     }
 }
 
-fn emit(random: &mut Random, rates: &Rates, shares: &[f64], fields: usize) -> bool {
-    for _ in 0..fields {
-        let _ = random.chance(rates.quoted_field);
-    }
+fn emit(random: &mut Random, rates: &Rates, _shares: &[f64], fields: usize) -> bool {
+    // Quoting and the chosen output part affect bytes only. Advance the
+    // SplitMix counter without evaluating those discarded random values.
+    random.skip(fields);
     let mut present = true;
     if random.chance(rates.malformed) {
         let fault = random.below(6);
         present = fault == 5;
         if fault == 5 {
-            let _ = random.by_cumulative(shares);
+            random.skip(1);
         }
     }
-    let _ = random.by_cumulative(shares);
+    random.skip(1);
     present
 }

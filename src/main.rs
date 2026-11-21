@@ -1,6 +1,8 @@
-use arrow2::array::{Array, MutableUtf8Array, PrimitiveArray, Utf8Array};
+use arrow2::array::{
+    Array, DictionaryArray, MutablePrimitiveArray, MutableUtf8Array, PrimitiveArray, Utf8Array,
+};
 use arrow2::chunk::Chunk;
-use arrow2::datatypes::{DataType, Field, Schema};
+use arrow2::datatypes::{DataType, Field, IntegerType, Schema};
 use arrow2::io::parquet::write::{
     CompressionOptions, Encoding, FileWriter, RowGroupIterator, Version, WriteOptions,
 };
@@ -695,8 +697,6 @@ impl LocalIdentity {
 
 struct ReplayShardAggregate {
     session_count: usize,
-    sessions: Vec<FastSession>,
-    clicks: Vec<FastClick>,
     user_daily: Vec<FastUserDaily>,
     campaign_daily: Vec<CampaignDaily>,
     shared_events: Vec<semantic::SemanticEvent>,
@@ -1064,8 +1064,6 @@ fn try_run_generator_replay(
         .map(|user_ranges| {
             let mut result = ReplayShardAggregate {
                 session_count: 0,
-                sessions: Vec::new(),
-                clicks: Vec::new(),
                 user_daily: Vec::new(),
                 campaign_daily: vec![CampaignDaily::default(); campaign_rows],
                 shared_events: Vec::new(),
@@ -1076,6 +1074,10 @@ fn try_run_generator_replay(
             let mut aliases = Vec::new();
             let mut events = Vec::new();
             let mut clicks = Vec::new();
+            let mut sessions = Vec::new();
+            let mut category_sums = vec![0u64; categories.len()];
+            let mut touched_categories = Vec::with_capacity(categories.len().min(64));
+            let mut attribution = FastAttributionScratch::new(campaigns.names.len());
             for users in user_ranges {
                 semantic::generate_shard_with(&dataset, users.clone(), |index, user_plan, shard| {
                 // Shared-device components are the only generated identities
@@ -1126,12 +1128,16 @@ fn try_run_generator_replay(
                         .cmp(&right.person)
                         .then_with(|| left.ts.cmp(&right.ts))
                 });
-                fast_sessionize_append(
+                sessions.clear();
+                fast_sessionize_append_with_scratch(
                     &events,
                     categories,
-                    &mut result.sessions,
+                    &mut sessions,
                     &mut result.user_daily,
+                    &mut category_sums,
+                    &mut touched_categories,
                 );
+                result.session_count += sessions.len();
 
                 clicks.clear();
                 clicks.reserve(shard.clicks.len());
@@ -1154,33 +1160,17 @@ fn try_run_generator_replay(
                         .then_with(|| left.ts.cmp(&right.ts))
                         .then_with(|| right.id.cmp(&left.id))
                 });
-                result.clicks.extend_from_slice(&clicks);
+                fast_attribute_and_assist_with_scratch(
+                    &sessions,
+                    &clicks,
+                    organic,
+                    first_day,
+                    day_count,
+                    &mut result.campaign_daily,
+                    &mut attribution,
+                );
                 });
             }
-
-            result.sessions.sort_unstable_by(|left, right| {
-                left.person
-                    .cmp(&right.person)
-                    .then_with(|| left.start.cmp(&right.start))
-            });
-            result.clicks.sort_unstable_by(|left, right| {
-                left.person
-                    .cmp(&right.person)
-                    .then_with(|| left.ts.cmp(&right.ts))
-                    .then_with(|| right.id.cmp(&left.id))
-            });
-            fast_attribute_and_assist(
-                &result.sessions,
-                &result.clicks,
-                campaigns.names.len(),
-                organic,
-                first_day,
-                day_count,
-                &mut result.campaign_daily,
-            );
-            result.session_count = result.sessions.len();
-            result.sessions = Vec::new();
-            result.clicks = Vec::new();
             result
         })
         .collect();
@@ -1759,6 +1749,26 @@ fn fast_sessionize_append(
 ) {
     let mut category_sums = vec![0u64; categories.len()];
     let mut touched = Vec::with_capacity(categories.len().min(64));
+    fast_sessionize_append_with_scratch(
+        events,
+        categories,
+        sessions,
+        user_daily,
+        &mut category_sums,
+        &mut touched,
+    );
+}
+
+fn fast_sessionize_append_with_scratch(
+    events: &[FastEvent],
+    categories: &[Vec<u8>],
+    sessions: &mut Vec<FastSession>,
+    user_daily: &mut Vec<FastUserDaily>,
+    category_sums: &mut [u64],
+    touched: &mut Vec<u32>,
+) {
+    debug_assert_eq!(category_sums.len(), categories.len());
+    debug_assert!(touched.is_empty());
     let mut person_start = 0usize;
     while person_start < events.len() {
         let person = events[person_start].person;
@@ -1788,11 +1798,11 @@ fn fast_sessionize_append(
                     day_sessions,
                     day_events,
                     day_revenue,
-                    &category_sums,
-                    &touched,
+                    category_sums,
+                    touched.as_slice(),
                     categories,
                 );
-                for &category in &touched {
+                for &category in touched.iter() {
                     category_sums[category as usize] = 0;
                 }
                 touched.clear();
@@ -1835,12 +1845,12 @@ fn fast_sessionize_append(
                 day_sessions,
                 day_events,
                 day_revenue,
-                &category_sums,
-                &touched,
+                category_sums,
+                touched.as_slice(),
                 categories,
             );
         }
-        for &category in &touched {
+        for &category in touched.iter() {
             category_sums[category as usize] = 0;
         }
         touched.clear();
@@ -1896,9 +1906,46 @@ fn fast_attribute_and_assist(
     day_count: usize,
     output: &mut [CampaignDaily],
 ) {
+    let mut scratch = FastAttributionScratch::new(campaign_count);
+    fast_attribute_and_assist_with_scratch(
+        sessions,
+        clicks,
+        organic,
+        first_day,
+        day_count,
+        output,
+        &mut scratch,
+    );
+}
+
+struct FastAttributionScratch {
+    campaign_times: Vec<Vec<i64>>,
+    touched_campaigns: Vec<u32>,
+    day_ranges: Vec<DayRange>,
+}
+
+impl FastAttributionScratch {
+    fn new(campaign_count: usize) -> Self {
+        Self {
+            campaign_times: (0..campaign_count).map(|_| Vec::new()).collect(),
+            touched_campaigns: Vec::with_capacity(campaign_count.min(256)),
+            day_ranges: Vec::with_capacity(16),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fast_attribute_and_assist_with_scratch(
+    sessions: &[FastSession],
+    clicks: &[FastClick],
+    organic: u32,
+    first_day: i32,
+    day_count: usize,
+    output: &mut [CampaignDaily],
+    scratch: &mut FastAttributionScratch,
+) {
     let mut click_at = 0usize;
-    let mut campaign_times: Vec<Vec<i64>> = (0..campaign_count).map(|_| Vec::new()).collect();
-    let mut touched_campaigns = Vec::with_capacity(campaign_count.min(256));
+    debug_assert!(scratch.touched_campaigns.is_empty());
     let mut session_start = 0usize;
     while session_start < sessions.len() {
         let person = sessions[session_start].person;
@@ -1936,13 +1983,13 @@ fn fast_attribute_and_assist(
             aggregate.purchasing_sessions += u64::from(session.purchasing);
         }
         for click in person_clicks {
-            let times = &mut campaign_times[click.campaign as usize];
+            let times = &mut scratch.campaign_times[click.campaign as usize];
             if times.is_empty() {
-                touched_campaigns.push(click.campaign);
+                scratch.touched_campaigns.push(click.campaign);
             }
             times.push(click.ts);
         }
-        let mut day_ranges = Vec::with_capacity(16);
+        scratch.day_ranges.clear();
         let mut range_start = 0usize;
         while range_start < person_sessions.len() {
             let day = person_sessions[range_start].day;
@@ -1950,15 +1997,15 @@ fn fast_attribute_and_assist(
             while range_end < person_sessions.len() && person_sessions[range_end].day == day {
                 range_end += 1;
             }
-            day_ranges.push(DayRange {
+            scratch.day_ranges.push(DayRange {
                 day,
                 start: range_start,
                 end: range_end,
             });
             range_start = range_end;
         }
-        for &campaign in &touched_campaigns {
-            let times = &campaign_times[campaign as usize];
+        for &campaign in &scratch.touched_campaigns {
+            let times = &scratch.campaign_times[campaign as usize];
             let mut at = 0usize;
             while at < times.len() {
                 let interval_start = times[at];
@@ -1970,7 +2017,7 @@ fn fast_attribute_and_assist(
                 }
                 let lo = person_sessions.partition_point(|session| session.start < interval_start);
                 let hi = person_sessions.partition_point(|session| session.start <= interval_end);
-                for range in &day_ranges {
+                for range in &scratch.day_ranges {
                     if range.end <= lo {
                         continue;
                     }
@@ -1982,9 +2029,9 @@ fn fast_attribute_and_assist(
                     output[campaign as usize * day_count + day].assisted_sessions += count as u64;
                 }
             }
-            campaign_times[campaign as usize].clear();
+            scratch.campaign_times[campaign as usize].clear();
         }
-        touched_campaigns.clear();
+        scratch.touched_campaigns.clear();
         session_start = session_end;
     }
 }
@@ -2021,49 +2068,71 @@ fn write_fast_user_daily_part(
     rows: &[FastUserDaily],
     categories: &[Vec<u8>],
 ) -> Result<()> {
-    let mut user_ids = MutableUtf8Array::<i32>::with_capacities(rows.len(), rows.len() * 9);
+    let mut user_keys = Vec::with_capacity(rows.len());
+    let mut user_values = MutableUtf8Array::<i32>::with_capacities(rows.len() / 3, rows.len() * 3);
     let mut days = Vec::with_capacity(rows.len());
     let mut sessions = Vec::with_capacity(rows.len());
     let mut events = Vec::with_capacity(rows.len());
     let mut revenue = Vec::with_capacity(rows.len());
-    let mut top_categories =
-        MutableUtf8Array::<i32>::with_capacities(rows.len(), rows.len() * 8);
+    let mut top_keys = MutablePrimitiveArray::<i32>::with_capacity(rows.len());
     let mut user = Vec::with_capacity(9);
+    let mut last_person = None;
+    let mut user_key = -1i32;
     for row in rows {
-        unpack_identifier(row.person, &mut user);
-        user_ids.push(Some(std::str::from_utf8(&user)?));
+        if last_person != Some(row.person) {
+            unpack_identifier(row.person, &mut user);
+            user_values.push(Some(std::str::from_utf8(&user)?));
+            user_key += 1;
+            last_person = Some(row.person);
+        }
+        user_keys.push(user_key);
         days.push(row.day);
         sessions.push(row.sessions as i64);
         events.push(row.events as i64);
         revenue.push(row.revenue as i64);
         if let Some(category) = row.top_category {
-            top_categories.push(Some(std::str::from_utf8(
-                &categories[category as usize],
-            )?));
+            top_keys.push(Some(category as i32));
         } else {
-            top_categories.push(None::<&str>);
+            top_keys.push(None);
         }
     }
+    let dictionary_utf8 = DataType::Dictionary(IntegerType::Int32, Box::new(DataType::Utf8), false);
+    let user_ids = DictionaryArray::<i32>::try_new(
+        dictionary_utf8.clone(),
+        PrimitiveArray::<i32>::from_vec(user_keys),
+        Into::<Utf8Array<i32>>::into(user_values).boxed(),
+    )?;
+    let category_values = Utf8Array::<i32>::from_slice(
+        categories
+            .iter()
+            .map(|category| std::str::from_utf8(category))
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+    );
+    let top_categories = DictionaryArray::<i32>::try_new(
+        dictionary_utf8.clone(),
+        top_keys.into(),
+        category_values.boxed(),
+    )?;
     let schema = Schema::from(vec![
-        Field::new("user_id", DataType::Utf8, false),
+        Field::new("user_id", dictionary_utf8.clone(), false),
         Field::new("day", DataType::Date32, false),
         Field::new("sessions", DataType::Int64, false),
         Field::new("events", DataType::Int64, false),
         Field::new("revenue_cents", DataType::Int64, false),
-        Field::new("top_category", DataType::Utf8, true),
+        Field::new("top_category", dictionary_utf8, true),
     ]);
     write_parquet(
         path,
         schema,
         vec![
-            Into::<Utf8Array<i32>>::into(user_ids).boxed(),
+            user_ids.boxed(),
             PrimitiveArray::<i32>::from_vec(days)
                 .to(DataType::Date32)
                 .boxed(),
             PrimitiveArray::<i64>::from_vec(sessions).boxed(),
             PrimitiveArray::<i64>::from_vec(events).boxed(),
             PrimitiveArray::<i64>::from_vec(revenue).boxed(),
-            Into::<Utf8Array<i32>>::into(top_categories).boxed(),
+            top_categories.boxed(),
         ],
     )
 }
@@ -2081,7 +2150,13 @@ fn write_parquet(path: &Path, schema: Schema, arrays: Vec<Box<dyn Array>>) -> Re
     let encodings = schema
         .fields
         .iter()
-        .map(|_| vec![Encoding::Plain])
+        .map(|field| match field.data_type() {
+            DataType::Dictionary(_, _, _) => vec![Encoding::RleDictionary],
+            DataType::Int32 | DataType::Int64 | DataType::Date32 => {
+                vec![Encoding::DeltaBinaryPacked]
+            }
+            _ => vec![Encoding::Plain],
+        })
         .collect();
     let chunk = Chunk::new(arrays);
     let row_groups = RowGroupIterator::try_new(
