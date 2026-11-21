@@ -5,6 +5,7 @@ target/
 .tools/
 dev/
 bench*/
+pgo-raw/
 dev-answer/
 generator/*
 !generator/src/

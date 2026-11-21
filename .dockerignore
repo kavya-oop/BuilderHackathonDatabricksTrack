@@ -6,6 +6,7 @@ target
 dev
 dev-answer
 bench*
+pgo-raw
 generator/target
 starter-duckdb
 starter-polars
