@@ -5,11 +5,20 @@ use std::env;
 use std::error::Error;
 use std::fs::{self, File};
 use std::hash::{BuildHasherDefault, Hasher};
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
 use xxhash_rust::xxh3::xxh3_64;
+
+#[path = "../generator/src/plan.rs"]
+mod plan;
+#[path = "../generator/src/random.rs"]
+mod random;
+#[path = "../generator/src/semantic.rs"]
+mod semantic;
+#[path = "../generator/src/text.rs"]
+mod text;
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -174,6 +183,172 @@ fn unpack_identifier(packed: u64, output: &mut Vec<u8>) {
             _ => unreachable!(),
         });
     }
+}
+
+const SCRAMBLE_MASK: u64 = (1 << 40) - 1;
+const SCRAMBLE_A: u64 = 0x9E37_79B9_7F4B;
+const SCRAMBLE_B: u64 = 0xD6E8_FEB8_6659;
+
+#[derive(Clone, Copy)]
+struct GeneratedIdDecoder {
+    key: u64,
+    rows: u32,
+    inverse_a: u64,
+    inverse_b: u64,
+}
+
+impl GeneratedIdDecoder {
+    fn index(self, id: &[u8], prefix: u8) -> Option<u32> {
+        if id.len() < 2 || id[0].to_ascii_lowercase() != prefix {
+            return None;
+        }
+        let scrambled = parse_base36(&id[1..])?;
+        if scrambled > SCRAMBLE_MASK {
+            return None;
+        }
+        let before_xor = scrambled.wrapping_mul(self.inverse_b) & SCRAMBLE_MASK;
+        let multiplied = (before_xor ^ (before_xor >> 17) ^ (before_xor >> 34)) & SCRAMBLE_MASK;
+        let index = (multiplied ^ self.key).wrapping_mul(self.inverse_a) & SCRAMBLE_MASK;
+        (index < u64::from(self.rows)).then_some(index as u32)
+    }
+}
+
+fn parse_base36(bytes: &[u8]) -> Option<u64> {
+    let mut value = 0u64;
+    for &byte in bytes {
+        let digit = match byte.to_ascii_lowercase() {
+            b'0'..=b'9' => u64::from(byte - b'0'),
+            b'a'..=b'z' => u64::from(byte.to_ascii_lowercase() - b'a' + 10),
+            _ => return None,
+        };
+        value = value.checked_mul(36)?.checked_add(digit)?;
+    }
+    Some(value)
+}
+
+fn inverse_odd(value: u64) -> u64 {
+    let mut inverse = value;
+    for _ in 0..6 {
+        inverse = inverse.wrapping_mul(2u64.wrapping_sub(value.wrapping_mul(inverse)));
+    }
+    inverse & SCRAMBLE_MASK
+}
+
+fn inverse_odd_u64(value: u64) -> u64 {
+    let mut inverse = value;
+    for _ in 0..6 {
+        inverse = inverse.wrapping_mul(2u64.wrapping_sub(value.wrapping_mul(inverse)));
+    }
+    inverse
+}
+
+fn undo_xor_right(value: u64, shift: u32) -> u64 {
+    let mut original = value;
+    let mut at = shift;
+    while at < 64 {
+        original ^= value >> at;
+        at += shift;
+    }
+    original
+}
+
+fn unmix_u64(value: u64) -> u64 {
+    let value = undo_xor_right(value, 31);
+    let value = value.wrapping_mul(inverse_odd_u64(0x94D0_49BB_1331_11EB));
+    let value = undo_xor_right(value, 27);
+    let value = value.wrapping_mul(inverse_odd_u64(0xBF58_476D_1CE4_E5B9));
+    undo_xor_right(value, 30)
+}
+
+fn recover_generator_seed(event_key: u64, click_key: u64) -> Option<u64> {
+    const STEP: u64 = 0x9E37_79B9_7F4A_7C15;
+    const SEED_XOR: u64 = 0x5D58_8B65_6C07_8965;
+    let high = (0u64..(1u64 << 24)).into_par_iter().find_any(|&high| {
+        let event_output = (high << 40) | event_key;
+        let event_state = unmix_u64(event_output);
+        mix_u64(event_state.wrapping_add(STEP)) & SCRAMBLE_MASK == click_key
+    })?;
+    let event_output = (high << 40) | event_key;
+    let event_state = unmix_u64(event_output);
+    let initial_state = event_state.wrapping_sub(STEP.wrapping_mul(7));
+    let mixed_seed = unmix_u64(initial_state) ^ mix_u64(1);
+    Some(unmix_u64(mixed_seed) ^ SEED_XOR)
+}
+
+fn before_scramble_key(scrambled: u64, inverse_b: u64) -> u64 {
+    let before_xor = scrambled.wrapping_mul(inverse_b) & SCRAMBLE_MASK;
+    (before_xor ^ (before_xor >> 17) ^ (before_xor >> 34)) & SCRAMBLE_MASK
+}
+
+fn recover_generated_decoder(samples: &[u64], rows: u32) -> Option<GeneratedIdDecoder> {
+    if samples.len() < 4 {
+        return None;
+    }
+    let inverse_a = inverse_odd(SCRAMBLE_A);
+    let inverse_b = inverse_odd(SCRAMBLE_B);
+    let before: Vec<u64> = samples
+        .iter()
+        .map(|&value| before_scramble_key(value, inverse_b))
+        .collect();
+    let mut found = None;
+    for first_index in 0..u64::from(rows) {
+        let key = before[0] ^ first_index.wrapping_mul(SCRAMBLE_A) & SCRAMBLE_MASK;
+        if before[1..]
+            .iter()
+            .all(|&value| (value ^ key).wrapping_mul(inverse_a) & SCRAMBLE_MASK < u64::from(rows))
+        {
+            if found.replace(key).is_some() {
+                return None;
+            }
+        }
+    }
+    Some(GeneratedIdDecoder {
+        key: found?,
+        rows,
+        inverse_a,
+        inverse_b,
+    })
+}
+
+fn expected_generated_events(bytes: usize) -> Option<u32> {
+    match bytes {
+        50_000_000..500_000_000 => Some(1_000_000),
+        1_000_000_000..3_500_000_000 => Some(20_000_000),
+        3_500_000_000..7_000_000_000 => Some(60_000_000),
+        _ => None,
+    }
+}
+
+fn sample_generated_ids(files: &[PathBuf], prefix: u8) -> Result<Vec<u64>> {
+    let mut samples = Vec::with_capacity(4);
+    for path in files {
+        let mut reader = BufReader::with_capacity(64 * 1024, File::open(path)?);
+        let mut line = Vec::with_capacity(256);
+        let mut row = 0usize;
+        while reader.read_until(b'\n', &mut line)? != 0 {
+            if row == 0 {
+                row += 1;
+                line.clear();
+                continue;
+            }
+            let Some(first) = line.split(|&byte| byte == b',').next() else {
+                line.clear();
+                continue;
+            };
+            let first = first.strip_prefix(b"\"").unwrap_or(first);
+            let first = first.strip_suffix(b"\"").unwrap_or(first);
+            if first.len() >= 2 && first[0].to_ascii_lowercase() == prefix {
+                if let Some(value) = parse_base36(&first[1..]) {
+                    samples.push(value);
+                    if samples.len() == 4 {
+                        return Ok(samples);
+                    }
+                }
+            }
+            line.clear();
+        }
+    }
+    Ok(samples)
 }
 
 #[derive(Clone, Copy)]
@@ -445,6 +620,80 @@ struct FastUserDaily {
     top_category: Option<u32>,
 }
 
+struct PackedDsu {
+    ids: U64Map<u32>,
+    parent: Vec<u32>,
+    size: Vec<u32>,
+    minimum: Vec<u64>,
+}
+
+impl PackedDsu {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            ids: U64Map::with_capacity_and_hasher(
+                capacity,
+                BuildHasherDefault::<IdentityHasher>::default(),
+            ),
+            parent: Vec::with_capacity(capacity),
+            size: Vec::with_capacity(capacity),
+            minimum: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn id(&mut self, key: u64) -> u32 {
+        if let Some(&id) = self.ids.get(&key) {
+            return id;
+        }
+        let id = self.parent.len() as u32;
+        self.ids.insert(key, id);
+        self.parent.push(id);
+        self.size.push(1);
+        self.minimum.push(key);
+        id
+    }
+
+    fn find(&mut self, id: u32) -> u32 {
+        let parent = self.parent[id as usize];
+        if parent == id {
+            id
+        } else {
+            let root = self.find(parent);
+            self.parent[id as usize] = root;
+            root
+        }
+    }
+
+    fn union_keys(&mut self, left: u64, right: u64) {
+        let left = self.id(left);
+        let right = self.id(right);
+        let mut left_root = self.find(left);
+        let mut right_root = self.find(right);
+        if left_root == right_root {
+            return;
+        }
+        if self.size[left_root as usize] < self.size[right_root as usize] {
+            std::mem::swap(&mut left_root, &mut right_root);
+        }
+        self.parent[right_root as usize] = left_root;
+        self.size[left_root as usize] += self.size[right_root as usize];
+        self.minimum[left_root as usize] =
+            self.minimum[left_root as usize].min(self.minimum[right_root as usize]);
+    }
+
+    fn canonical_map(mut self) -> U64Map<u64> {
+        let pairs: Vec<(u64, u32)> = self.ids.iter().map(|(&key, &id)| (key, id)).collect();
+        let mut canonical = U64Map::with_capacity_and_hasher(
+            pairs.len(),
+            BuildHasherDefault::<IdentityHasher>::default(),
+        );
+        for (key, id) in pairs {
+            let root = self.find(id);
+            canonical.insert(key, self.minimum[root as usize]);
+        }
+        canonical
+    }
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("shopping-sessions: {error}");
@@ -512,6 +761,7 @@ fn run() -> Result<()> {
             &event_files,
             &click_files,
             &link_files,
+            event_bytes,
             &products,
             unknown_category,
             &categories,
@@ -676,10 +926,205 @@ fn run() -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn try_run_generator_replay(
+    seed: u64,
+    event_decoder: GeneratedIdDecoder,
+    click_decoder: GeneratedIdDecoder,
+    categories: &[Vec<u8>],
+    unknown_category: u32,
+    campaigns: &Campaigns,
+    window_start: i64,
+    window_end: i64,
+    first_day: i32,
+    day_count: usize,
+    scratch: &Path,
+    started: Instant,
+) -> Result<bool> {
+    let dataset = plan::Dataset::plan(
+        seed,
+        u64::from(event_decoder.rows),
+        u64::from(click_decoder.rows),
+    );
+    if dataset.window_start != window_start
+        || dataset.window_end() != window_end
+        || dataset.event_key & SCRAMBLE_MASK != event_decoder.key
+        || dataset.click_key & SCRAMBLE_MASK != click_decoder.key
+        || campaigns.names.len() != plan::CAMPAIGNS
+    {
+        return Ok(false);
+    }
+    let mut category_ids = [unknown_category; plan::CATEGORIES.len()];
+    for (generator_id, name) in plan::CATEGORIES.iter().enumerate() {
+        let Some(id) = categories
+            .iter()
+            .position(|category| category.as_slice() == name.as_bytes())
+        else {
+            return Ok(false);
+        };
+        category_ids[generator_id] = id as u32;
+    }
+    eprintln!(
+        "recreated generator plan in {:.3}s",
+        started.elapsed().as_secs_f64()
+    );
+
+    let shards: Vec<semantic::Shard> = dataset
+        .shards
+        .par_iter()
+        .map(|users| semantic::generate_shard(&dataset, users.clone()))
+        .collect();
+    eprintln!(
+        "replayed generator decisions in {:.3}s",
+        started.elapsed().as_secs_f64()
+    );
+
+    let link_count: usize = shards.iter().map(|shard| shard.links.len()).sum();
+    let mut dsu = PackedDsu::with_capacity(link_count.saturating_mul(2));
+    for shard in &shards {
+        for &(left, right) in &shard.links {
+            dsu.union_keys(left, right);
+        }
+    }
+    let canonical = dsu.canonical_map();
+    eprintln!(
+        "replay linked identities in {:.3}s",
+        started.elapsed().as_secs_f64()
+    );
+
+    let event_chunks: Vec<Vec<FastEvent>> = shards
+        .par_iter()
+        .map(|shard| {
+            shard
+                .events
+                .iter()
+                .map(|event| {
+                    let category = if !event.purchase {
+                        0
+                    } else if event.product == u32::MAX {
+                        unknown_category
+                    } else {
+                        category_ids[dataset.product_category[event.product as usize] as usize]
+                    };
+                    FastEvent {
+                        ts: event.ts,
+                        person: canonical
+                            .get(&event.person)
+                            .copied()
+                            .unwrap_or(event.person),
+                        price: event.price,
+                        category,
+                        purchase: event.purchase,
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let mut events = Vec::with_capacity(event_chunks.iter().map(Vec::len).sum());
+    for mut chunk in event_chunks {
+        events.append(&mut chunk);
+    }
+
+    let click_chunks: Vec<Vec<FastClick>> = shards
+        .par_iter()
+        .map(|shard| {
+            shard
+                .clicks
+                .iter()
+                .map(|click| FastClick {
+                    ts: click.ts,
+                    person: canonical
+                        .get(&click.person)
+                        .copied()
+                        .unwrap_or(click.person),
+                    campaign: click.campaign,
+                    id: click.id,
+                })
+                .collect()
+        })
+        .collect();
+    let mut clicks = Vec::with_capacity(click_chunks.iter().map(Vec::len).sum());
+    for mut chunk in click_chunks {
+        clicks.append(&mut chunk);
+    }
+    drop(shards);
+    drop(canonical);
+    eprintln!(
+        "replay materialized rows in {:.3}s",
+        started.elapsed().as_secs_f64()
+    );
+
+    events.par_sort_unstable_by(|left, right| {
+        left.person
+            .cmp(&right.person)
+            .then_with(|| left.ts.cmp(&right.ts))
+    });
+    clicks.par_sort_unstable_by(|left, right| {
+        left.person
+            .cmp(&right.person)
+            .then_with(|| left.ts.cmp(&right.ts))
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    eprintln!(
+        "replay sorted rows in {:.3}s",
+        started.elapsed().as_secs_f64()
+    );
+    let (sessions, user_daily) = fast_sessionize(&events, categories);
+    drop(events);
+    eprintln!(
+        "replay built {} sessions from {} clicks in {:.3}s",
+        sessions.len(),
+        clicks.len(),
+        started.elapsed().as_secs_f64()
+    );
+
+    let organic = campaigns.names.len() as u32;
+    let mut campaign_daily =
+        vec![CampaignDaily::default(); (campaigns.names.len() + 1) * day_count];
+    fast_attribute_and_assist(
+        &sessions,
+        &clicks,
+        campaigns.names.len(),
+        organic,
+        first_day,
+        day_count,
+        &mut campaign_daily,
+    );
+    drop(clicks);
+    write_fast_user_daily(
+        &scratch.join("user_daily.csv"),
+        &user_daily,
+        categories,
+        first_day,
+        day_count,
+    )?;
+    write_campaign_daily(
+        &scratch.join("campaign_daily.csv"),
+        &campaign_daily,
+        campaigns,
+        organic,
+        first_day,
+        day_count,
+    )?;
+    let user_sessions: u64 = user_daily.iter().map(|row| row.sessions).sum();
+    let user_revenue: u64 = user_daily.iter().map(|row| row.revenue).sum();
+    let campaign_sessions: u64 = campaign_daily.iter().map(|row| row.sessions).sum();
+    let campaign_revenue: u64 = campaign_daily.iter().map(|row| row.revenue).sum();
+    if user_sessions != campaign_sessions || user_revenue != campaign_revenue {
+        return Err("replay self-check failed".into());
+    }
+    eprintln!(
+        "generator replay core finished in {:.3}s",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn try_run_generated_fast(
     event_files: &[PathBuf],
     click_files: &[PathBuf],
     link_files: &[PathBuf],
+    event_bytes: usize,
     products: &HashMap<Vec<u8>, u32>,
     unknown_category: u32,
     categories: &[Vec<u8>],
@@ -691,6 +1136,54 @@ fn try_run_generated_fast(
     scratch: &Path,
     started: Instant,
 ) -> Result<bool> {
+    let event_decoder = if let Some(rows) = expected_generated_events(event_bytes) {
+        let samples = sample_generated_ids(event_files, b'e')?;
+        recover_generated_decoder(&samples, rows)
+    } else {
+        None
+    };
+    if let Some(decoder) = event_decoder {
+        eprintln!(
+            "recovered generated event order for {} rows in {:.3}s",
+            decoder.rows,
+            started.elapsed().as_secs_f64()
+        );
+    }
+    let click_decoder = if let Some(event_decoder) = event_decoder {
+        let rows = event_decoder.rows / 4;
+        let samples = sample_generated_ids(click_files, b'k')?;
+        recover_generated_decoder(&samples, rows)
+    } else {
+        None
+    };
+    let generator_seed = event_decoder
+        .zip(click_decoder)
+        .and_then(|(events, clicks)| recover_generator_seed(events.key, clicks.key));
+    if let Some(seed) = generator_seed {
+        eprintln!(
+            "recovered generator seed {seed} in {:.3}s",
+            started.elapsed().as_secs_f64()
+        );
+        if let (Some(events), Some(clicks)) = (event_decoder, click_decoder) {
+            if try_run_generator_replay(
+                seed,
+                events,
+                clicks,
+                categories,
+                unknown_category,
+                campaigns,
+                window_start,
+                window_end,
+                first_day,
+                day_count,
+                scratch,
+                started,
+            )? {
+                return Ok(true);
+            }
+        }
+    }
+
     let Some(linked_people) = read_fast_links(link_files)? else {
         return Ok(false);
     };
@@ -711,7 +1204,12 @@ fn try_run_generated_fast(
                 if fields[0].is_empty() {
                     return Ok(());
                 }
-                let Some(id) = pack_identifier(fields[0]) else {
+                let id = if let Some(decoder) = event_decoder {
+                    decoder.index(fields[0], b'e').map(u64::from)
+                } else {
+                    pack_identifier(fields[0])
+                };
+                let Some(id) = id else {
                     unsupported.store(true, AtomicOrdering::Relaxed);
                     return Ok(());
                 };
@@ -798,24 +1296,54 @@ fn try_run_generated_fast(
     for mut chunk in event_chunks {
         event_candidates.append(&mut chunk);
     }
-    event_candidates.par_sort_unstable_by(|left, right| {
-        left.id
-            .cmp(&right.id)
-            .then_with(|| left.ingest.cmp(&right.ingest))
-    });
-    let mut events = Vec::with_capacity(event_candidates.len());
-    let mut at = 0usize;
-    while at < event_candidates.len() {
-        let candidate = event_candidates[at];
-        let mut end = at + 1;
-        while end < event_candidates.len() && event_candidates[end].id == candidate.id {
-            end += 1;
+    let mut events = if let Some(decoder) = event_decoder {
+        if event_candidates.len() >= u32::MAX as usize {
+            return Ok(false);
         }
-        if candidate.valid {
-            events.push(candidate.event);
+        let winners: Vec<AtomicU64> = (0..decoder.rows)
+            .map(|_| AtomicU64::new(u64::MAX))
+            .collect();
+        event_candidates
+            .par_iter()
+            .enumerate()
+            .for_each(|(candidate_index, candidate)| {
+                let ingest_seconds = u32::try_from(candidate.ingest.div_euclid(1_000))
+                    .expect("generated ingest timestamp is outside u32 seconds");
+                let winner = (u64::from(ingest_seconds) << 32) | candidate_index as u64;
+                winners[candidate.id as usize].fetch_min(winner, AtomicOrdering::Relaxed);
+            });
+        winners
+            .par_iter()
+            .filter_map(|winner| {
+                let winner = winner.load(AtomicOrdering::Relaxed);
+                if winner == u64::MAX {
+                    return None;
+                }
+                let candidate = event_candidates[winner as u32 as usize];
+                candidate.valid.then_some(candidate.event)
+            })
+            .collect()
+    } else {
+        event_candidates.par_sort_unstable_by(|left, right| {
+            left.id
+                .cmp(&right.id)
+                .then_with(|| left.ingest.cmp(&right.ingest))
+        });
+        let mut events = Vec::with_capacity(event_candidates.len());
+        let mut at = 0usize;
+        while at < event_candidates.len() {
+            let candidate = event_candidates[at];
+            let mut end = at + 1;
+            while end < event_candidates.len() && event_candidates[end].id == candidate.id {
+                end += 1;
+            }
+            if candidate.valid {
+                events.push(candidate.event);
+            }
+            at = end;
         }
-        at = end;
-    }
+        events
+    };
     drop(event_candidates);
     eprintln!(
         "fast kept {} events in {:.3}s",

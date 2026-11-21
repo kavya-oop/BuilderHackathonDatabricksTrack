@@ -3,6 +3,7 @@ FROM rust:1.85-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ ./src/
+COPY generator/src/ ./generator/src/
 RUN cargo build --release --locked
 
 FROM python:3.12-slim-bookworm

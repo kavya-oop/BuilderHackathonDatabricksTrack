@@ -6,7 +6,13 @@ target/
 dev/
 bench*/
 dev-answer/
-generator/
+generator/*
+!generator/src/
+generator/src/*
+!generator/src/plan.rs
+!generator/src/random.rs
+!generator/src/semantic.rs
+!generator/src/text.rs
 starter-duckdb/
 starter-polars/
 starter-pyspark/

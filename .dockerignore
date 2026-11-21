@@ -6,7 +6,7 @@ target
 dev
 dev-answer
 bench*
-generator
+generator/target
 starter-duckdb
 starter-polars
 starter-pyspark

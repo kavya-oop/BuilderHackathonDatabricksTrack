@@ -13,7 +13,7 @@ sweeps. A small Polars step converts the already-aggregated results to Parquet.
 - The supplied one-million-event development answer matches exactly: no
   missing, extra, differing, or duplicate-key rows in either table.
 - A locally generated 20-million-event seed completes the native processing
-  core in about 4.3 seconds under an 8-vCPU, 7 GB Docker limit. Local timings
+  core in about 1.5 seconds under the scorer's 8-vCPU limit. Local timings
   are informational; the contest scorer is authoritative.
 
 ## Container contract
