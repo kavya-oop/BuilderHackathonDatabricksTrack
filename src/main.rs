@@ -1100,49 +1100,75 @@ fn try_run_generator_replay(
                     aliases.push(identity.canonical(id));
                 }
 
-                events.clear();
-                events.reserve(shard.events.len());
-                for event in &shard.events {
-                    let person = if event.person & semantic::EXCEPTIONAL_PERSON == 0 {
-                        aliases[(event.person % semantic::ALIAS_SLOTS) as usize]
-                    } else {
-                        identity.canonical(event.person & !semantic::EXCEPTIONAL_PERSON)
-                    };
-                    let category = if !event.purchase {
-                        0
-                    } else if event.product == u32::MAX {
-                        unknown_category
-                    } else {
-                        category_ids[dataset.product_category[event.product as usize] as usize]
-                    };
-                    events.push(FastEvent {
-                        ts: event.ts,
-                        person,
-                        price: event.price,
-                        category,
-                        purchase: event.purchase,
-                    });
-                }
-                events.sort_unstable_by(|left, right| {
-                    left.person
-                        .cmp(&right.person)
-                        .then_with(|| left.ts.cmp(&right.ts))
-                });
                 sessions.clear();
-                fast_sessionize_append_with_scratch(
-                    &events,
-                    categories,
-                    &mut sessions,
-                    &mut result.user_daily,
-                    &mut category_sums,
-                    &mut touched_categories,
-                );
+                let simple_person = aliases.first().copied().filter(|first| {
+                    aliases.iter().all(|person| person == first)
+                        && shard.events.iter().all(|event| {
+                            event.person & semantic::EXCEPTIONAL_PERSON == 0
+                        })
+                        && shard.clicks.iter().all(|click| {
+                            click.person & semantic::EXCEPTIONAL_PERSON == 0
+                        })
+                });
+                if let Some(person) = simple_person {
+                    semantic_sessionize_append_with_scratch(
+                        &shard.events,
+                        person,
+                        &dataset.product_category,
+                        &category_ids,
+                        unknown_category,
+                        categories,
+                        &mut sessions,
+                        &mut result.user_daily,
+                        &mut category_sums,
+                        &mut touched_categories,
+                    );
+                } else {
+                    events.clear();
+                    events.reserve(shard.events.len());
+                    for event in &shard.events {
+                        let person = if event.person & semantic::EXCEPTIONAL_PERSON == 0 {
+                            aliases[(event.person % semantic::ALIAS_SLOTS) as usize]
+                        } else {
+                            identity.canonical(event.person & !semantic::EXCEPTIONAL_PERSON)
+                        };
+                        let category = if !event.purchase {
+                            0
+                        } else if event.product == u32::MAX {
+                            unknown_category
+                        } else {
+                            category_ids[dataset.product_category[event.product as usize] as usize]
+                        };
+                        events.push(FastEvent {
+                            ts: event.ts,
+                            person,
+                            price: event.price,
+                            category,
+                            purchase: event.purchase,
+                        });
+                    }
+                    events.sort_unstable_by(|left, right| {
+                        left.person
+                            .cmp(&right.person)
+                            .then_with(|| left.ts.cmp(&right.ts))
+                    });
+                    fast_sessionize_append_with_scratch(
+                        &events,
+                        categories,
+                        &mut sessions,
+                        &mut result.user_daily,
+                        &mut category_sums,
+                        &mut touched_categories,
+                    );
+                }
                 result.session_count += sessions.len();
 
                 clicks.clear();
                 clicks.reserve(shard.clicks.len());
                 for click in &shard.clicks {
-                    let person = if click.person & semantic::EXCEPTIONAL_PERSON == 0 {
+                    let person = if let Some(person) = simple_person {
+                        person
+                    } else if click.person & semantic::EXCEPTIONAL_PERSON == 0 {
                         aliases[(click.person % semantic::ALIAS_SLOTS) as usize]
                     } else {
                         identity.canonical(click.person & !semantic::EXCEPTIONAL_PERSON)
@@ -1154,12 +1180,20 @@ fn try_run_generator_replay(
                         id: click.id,
                     });
                 }
-                clicks.sort_unstable_by(|left, right| {
-                    left.person
-                        .cmp(&right.person)
-                        .then_with(|| left.ts.cmp(&right.ts))
-                        .then_with(|| right.id.cmp(&left.id))
-                });
+                if simple_person.is_some() {
+                    clicks.sort_unstable_by(|left, right| {
+                        left.ts
+                            .cmp(&right.ts)
+                            .then_with(|| right.id.cmp(&left.id))
+                    });
+                } else {
+                    clicks.sort_unstable_by(|left, right| {
+                        left.person
+                            .cmp(&right.person)
+                            .then_with(|| left.ts.cmp(&right.ts))
+                            .then_with(|| right.id.cmp(&left.id))
+                    });
+                }
                 fast_attribute_and_assist_with_scratch(
                     &sessions,
                     &clicks,
@@ -1859,6 +1893,115 @@ fn fast_sessionize_append_with_scratch(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn semantic_sessionize_append_with_scratch(
+    events: &[semantic::SemanticEvent],
+    person: u64,
+    product_category: &[u8],
+    category_ids: &[u32; plan::CATEGORIES.len()],
+    unknown_category: u32,
+    categories: &[Vec<u8>],
+    sessions: &mut Vec<FastSession>,
+    user_daily: &mut Vec<FastUserDaily>,
+    category_sums: &mut [u64],
+    touched: &mut Vec<u32>,
+) {
+    debug_assert_eq!(category_sums.len(), categories.len());
+    debug_assert!(touched.is_empty());
+    if events.is_empty() {
+        return;
+    }
+    let mut current_day = None;
+    let mut day_sessions = 0u64;
+    let mut day_events = 0u64;
+    let mut day_revenue = 0u64;
+    let mut previous_ts = None;
+    let mut session_start = 0i64;
+    let mut session_revenue = 0u64;
+    let mut session_purchasing = false;
+    for event in events {
+        if previous_ts.is_none_or(|previous| event.ts - previous > SESSION_GAP_MS) {
+            if previous_ts.is_some() {
+                sessions.push(FastSession {
+                    start: session_start,
+                    revenue: session_revenue,
+                    person,
+                    day: current_day.expect("session has a day"),
+                    purchasing: session_purchasing,
+                });
+            }
+            let day = event.ts.div_euclid(DAY_MS) as i32;
+            if current_day.is_some_and(|current| current != day) {
+                finish_fast_user_day(
+                    user_daily,
+                    person,
+                    current_day.unwrap(),
+                    day_sessions,
+                    day_events,
+                    day_revenue,
+                    category_sums,
+                    touched.as_slice(),
+                    categories,
+                );
+                for &category in touched.iter() {
+                    category_sums[category as usize] = 0;
+                }
+                touched.clear();
+                day_sessions = 0;
+                day_events = 0;
+                day_revenue = 0;
+            }
+            current_day = Some(day);
+            day_sessions += 1;
+            session_start = event.ts;
+            session_revenue = 0;
+            session_purchasing = false;
+        }
+        previous_ts = Some(event.ts);
+        day_events += 1;
+        if event.purchase {
+            session_purchasing = true;
+            let price = event.price as u64;
+            session_revenue += price;
+            day_revenue += price;
+            let category = if event.product == u32::MAX {
+                unknown_category
+            } else {
+                category_ids[product_category[event.product as usize] as usize]
+            };
+            let slot = &mut category_sums[category as usize];
+            if *slot == 0 {
+                touched.push(category);
+            }
+            *slot += price;
+        }
+    }
+    sessions.push(FastSession {
+        start: session_start,
+        revenue: session_revenue,
+        person,
+        day: current_day.expect("event has a day"),
+        purchasing: session_purchasing,
+    });
+    if let Some(day) = current_day {
+        finish_fast_user_day(
+            user_daily,
+            person,
+            day,
+            day_sessions,
+            day_events,
+            day_revenue,
+            category_sums,
+            touched.as_slice(),
+            categories,
+        );
+    }
+    for &category in touched.iter() {
+        category_sums[category as usize] = 0;
+    }
+    touched.clear();
+}
+
+#[allow(clippy::too_many_arguments)]
 fn finish_fast_user_day(
     output: &mut Vec<FastUserDaily>,
     person: u64,
@@ -1919,18 +2062,30 @@ fn fast_attribute_and_assist(
 }
 
 struct FastAttributionScratch {
-    campaign_times: Vec<Vec<i64>>,
+    active_counts: Vec<u32>,
+    campaign_epochs: Vec<u32>,
     touched_campaigns: Vec<u32>,
-    day_ranges: Vec<DayRange>,
+    epoch: u32,
 }
 
 impl FastAttributionScratch {
     fn new(campaign_count: usize) -> Self {
         Self {
-            campaign_times: (0..campaign_count).map(|_| Vec::new()).collect(),
+            active_counts: vec![0; campaign_count],
+            campaign_epochs: vec![0; campaign_count],
             touched_campaigns: Vec::with_capacity(campaign_count.min(256)),
-            day_ranges: Vec::with_capacity(16),
+            epoch: 1,
         }
+    }
+
+    fn start_person(&mut self) -> u32 {
+        let epoch = self.epoch;
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.campaign_epochs.fill(0);
+            self.epoch = 1;
+        }
+        epoch
     }
 }
 
@@ -1962,12 +2117,26 @@ fn fast_attribute_and_assist_with_scratch(
         }
         let person_sessions = &sessions[session_start..session_end];
         let person_clicks = &clicks[click_start..click_at];
+        let epoch = scratch.start_person();
+        let mut active_start = 0usize;
         let mut eligible_end = 0usize;
         for session in person_sessions {
             while eligible_end < person_clicks.len()
                 && person_clicks[eligible_end].ts <= session.start
             {
+                let campaign = person_clicks[eligible_end].campaign as usize;
+                if scratch.campaign_epochs[campaign] != epoch {
+                    scratch.campaign_epochs[campaign] = epoch;
+                    scratch.touched_campaigns.push(campaign as u32);
+                }
+                scratch.active_counts[campaign] += 1;
                 eligible_end += 1;
+            }
+            while active_start < eligible_end
+                && person_clicks[active_start].ts < session.start - ATTRIBUTION_MS
+            {
+                scratch.active_counts[person_clicks[active_start].campaign as usize] -= 1;
+                active_start += 1;
             }
             let credited = if eligible_end > 0
                 && session.start - person_clicks[eligible_end - 1].ts <= ATTRIBUTION_MS
@@ -1981,55 +2150,14 @@ fn fast_attribute_and_assist_with_scratch(
             aggregate.sessions += 1;
             aggregate.revenue += session.revenue;
             aggregate.purchasing_sessions += u64::from(session.purchasing);
-        }
-        for click in person_clicks {
-            let times = &mut scratch.campaign_times[click.campaign as usize];
-            if times.is_empty() {
-                scratch.touched_campaigns.push(click.campaign);
+            for &campaign in &scratch.touched_campaigns {
+                if scratch.active_counts[campaign as usize] != 0 {
+                    output[campaign as usize * day_count + day].assisted_sessions += 1;
+                }
             }
-            times.push(click.ts);
-        }
-        scratch.day_ranges.clear();
-        let mut range_start = 0usize;
-        while range_start < person_sessions.len() {
-            let day = person_sessions[range_start].day;
-            let mut range_end = range_start + 1;
-            while range_end < person_sessions.len() && person_sessions[range_end].day == day {
-                range_end += 1;
-            }
-            scratch.day_ranges.push(DayRange {
-                day,
-                start: range_start,
-                end: range_end,
-            });
-            range_start = range_end;
         }
         for &campaign in &scratch.touched_campaigns {
-            let times = &scratch.campaign_times[campaign as usize];
-            let mut at = 0usize;
-            while at < times.len() {
-                let interval_start = times[at];
-                let mut interval_end = interval_start + ATTRIBUTION_MS;
-                at += 1;
-                while at < times.len() && times[at] <= interval_end {
-                    interval_end = interval_end.max(times[at] + ATTRIBUTION_MS);
-                    at += 1;
-                }
-                let lo = person_sessions.partition_point(|session| session.start < interval_start);
-                let hi = person_sessions.partition_point(|session| session.start <= interval_end);
-                for range in &scratch.day_ranges {
-                    if range.end <= lo {
-                        continue;
-                    }
-                    if range.start >= hi {
-                        break;
-                    }
-                    let count = range.end.min(hi) - range.start.max(lo);
-                    let day = (range.day - first_day) as usize;
-                    output[campaign as usize * day_count + day].assisted_sessions += count as u64;
-                }
-            }
-            scratch.campaign_times[campaign as usize].clear();
+            scratch.active_counts[campaign as usize] = 0;
         }
         scratch.touched_campaigns.clear();
         session_start = session_end;
