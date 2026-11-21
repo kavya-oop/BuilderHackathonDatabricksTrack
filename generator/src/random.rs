@@ -10,12 +10,6 @@
 /// `(seed, stream, index)`.
 pub struct Random {
     state: u64,
-    #[cfg(target_arch = "x86_64")]
-    buffered: [u64; 4],
-    #[cfg(target_arch = "x86_64")]
-    buffered_at: u8,
-    #[cfg(target_arch = "x86_64")]
-    avx2: bool,
 }
 
 /// Integer cutoff equivalent to `draw_as_f64 < probability * 2^53`.
@@ -36,29 +30,10 @@ impl Random {
         let state = mix(mix(seed ^ 0x5D58_8B65_6C07_8965)
             ^ mix(stream as u64 + 1)
             ^ index.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        Self {
-            state,
-            #[cfg(target_arch = "x86_64")]
-            buffered: [0; 4],
-            #[cfg(target_arch = "x86_64")]
-            buffered_at: 4,
-            #[cfg(target_arch = "x86_64")]
-            avx2: std::arch::is_x86_feature_detected!("avx2"),
-        }
+        Self { state }
     }
 
     pub fn next_u64(&mut self) -> u64 {
-        #[cfg(target_arch = "x86_64")]
-        if self.avx2 {
-            if self.buffered_at == 4 {
-                self.buffered = unsafe { mix4_avx2(self.state) };
-                self.state = self.state.wrapping_add(Self::STEP.wrapping_mul(4));
-                self.buffered_at = 0;
-            }
-            let value = self.buffered[self.buffered_at as usize];
-            self.buffered_at += 1;
-            return value;
-        }
         self.state = self.state.wrapping_add(Self::STEP);
         mix(self.state)
     }
@@ -67,19 +42,6 @@ impl Random {
     /// counter-based, so advancing the state is identical to generating and
     /// discarding every intermediate value.
     pub fn skip(&mut self, draws: usize) {
-        #[cfg(target_arch = "x86_64")]
-        if self.avx2 {
-            let buffered = 4usize - self.buffered_at as usize;
-            if draws <= buffered {
-                self.buffered_at += draws as u8;
-            } else {
-                self.buffered_at = 4;
-                self.state = self
-                    .state
-                    .wrapping_add(Self::STEP.wrapping_mul((draws - buffered) as u64));
-            }
-            return;
-        }
         self.state = self
             .state
             .wrapping_add(Self::STEP.wrapping_mul(draws as u64));
@@ -152,50 +114,6 @@ fn mix(value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn mullo_u64_avx2(
-    left: std::arch::x86_64::__m256i,
-    right: std::arch::x86_64::__m256i,
-) -> std::arch::x86_64::__m256i {
-    use std::arch::x86_64::*;
-    let low = _mm256_mul_epu32(left, right);
-    let left_high = _mm256_srli_epi64(left, 32);
-    let right_high = _mm256_srli_epi64(right, 32);
-    let cross = _mm256_add_epi64(
-        _mm256_mul_epu32(left_high, right),
-        _mm256_mul_epu32(left, right_high),
-    );
-    _mm256_add_epi64(low, _mm256_slli_epi64(cross, 32))
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn mix4_avx2(state: u64) -> [u64; 4] {
-    use std::arch::x86_64::*;
-    let step = Random::STEP;
-    let mut values = _mm256_set_epi64x(
-        state.wrapping_add(step.wrapping_mul(4)) as i64,
-        state.wrapping_add(step.wrapping_mul(3)) as i64,
-        state.wrapping_add(step.wrapping_mul(2)) as i64,
-        state.wrapping_add(step) as i64,
-    );
-    values = _mm256_xor_si256(values, _mm256_srli_epi64(values, 30));
-    values = mullo_u64_avx2(
-        values,
-        _mm256_set1_epi64x(0xBF58_476D_1CE4_E5B9u64 as i64),
-    );
-    values = _mm256_xor_si256(values, _mm256_srli_epi64(values, 27));
-    values = mullo_u64_avx2(
-        values,
-        _mm256_set1_epi64x(0x94D0_49BB_1331_11EBu64 as i64),
-    );
-    values = _mm256_xor_si256(values, _mm256_srli_epi64(values, 31));
-    let mut output = [0u64; 4];
-    _mm256_storeu_si256(output.as_mut_ptr().cast(), values);
-    output
-}
-
 /// Which stream a draw comes from. Adding a stream never changes the others.
 #[derive(Clone, Copy)]
 pub enum Stream {
@@ -208,54 +126,4 @@ pub enum Stream {
     ShuffleClicks,
     Parts,
     ShuffleLinks,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::hint::black_box;
-    use std::time::Instant;
-
-    #[test]
-    fn buffered_stream_matches_scalar_with_skips() {
-        let mut buffered = Random::new(17, Stream::User, 29);
-        let mut scalar_state = buffered.state;
-        for at in 0..10_000usize {
-            if at % 7 == 0 {
-                let skip = at % 5;
-                buffered.skip(skip);
-                scalar_state = scalar_state.wrapping_add(Random::STEP.wrapping_mul(skip as u64));
-            }
-            scalar_state = scalar_state.wrapping_add(Random::STEP);
-            assert_eq!(buffered.next_u64(), mix(scalar_state));
-        }
-    }
-
-    #[test]
-    fn report_simd_throughput() {
-        if !std::arch::is_x86_feature_detected!("avx2") {
-            eprintln!("random benchmark skipped: AVX2 unavailable");
-            return;
-        }
-        const DRAWS: usize = 20_000_000;
-        let mut scalar_state = 123u64;
-        let mut checksum = 0u64;
-        let started = Instant::now();
-        for _ in 0..DRAWS {
-            scalar_state = scalar_state.wrapping_add(Random::STEP);
-            checksum ^= black_box(mix(scalar_state));
-        }
-        let scalar = started.elapsed();
-
-        let mut buffered = Random::new(123, Stream::User, 0);
-        let started = Instant::now();
-        for _ in 0..DRAWS {
-            checksum ^= black_box(buffered.next_u64());
-        }
-        let simd = started.elapsed();
-        eprintln!(
-            "random benchmark: scalar={scalar:?} simd={simd:?} ratio={:.3} checksum={checksum}",
-            simd.as_secs_f64() / scalar.as_secs_f64()
-        );
-    }
 }
