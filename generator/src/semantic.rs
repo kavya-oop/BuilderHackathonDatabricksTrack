@@ -314,7 +314,7 @@ impl<'a> SemanticUser<'a> {
         } else {
             consume_valid_timestamp(&mut self.random, ts);
         }
-        let ingest_ts = ingest(
+        let (original_on_time, duplicate_on_time) = ingest_validity(
             &mut self.random,
             self.dataset.rate_thresholds.late,
             ts,
@@ -406,7 +406,7 @@ impl<'a> SemanticUser<'a> {
             7,
         );
         let mut winner_recorded = original_present;
-        if original_present && base_valid && !special_bad_original && ingest_ts - ts <= DAY {
+        if original_present && base_valid && !special_bad_original && original_on_time {
             shard.events.push(SemanticEvent {
                 ts,
                 person: person.unwrap(),
@@ -420,7 +420,9 @@ impl<'a> SemanticUser<'a> {
             person = Some(other as u64 * ALIAS_SLOTS);
         }
         for _ in 0..copies {
-            let later = ingest_ts + self.random.between(1, 600) * SECOND;
+            // The exact duplicate ingest timestamp cannot affect the answer;
+            // only whether it remains within the one-day limit matters.
+            self.random.skip(1);
             let present = emit(
                 &mut self.random,
                 self.dataset.rate_thresholds.malformed,
@@ -428,7 +430,7 @@ impl<'a> SemanticUser<'a> {
             );
             if present && !winner_recorded {
                 winner_recorded = true;
-                if base_valid && later - ts <= DAY {
+                if base_valid && duplicate_on_time {
                     shard.events.push(SemanticEvent {
                         ts,
                         person: person.unwrap(),
@@ -757,19 +759,24 @@ fn outside(random: &mut Random, window_start: i64, window_end: i64) -> i64 {
     }
 }
 
-fn ingest(random: &mut Random, late_threshold: u64, ts: i64) -> i64 {
+fn ingest_validity(random: &mut Random, late_threshold: u64, ts: i64) -> (bool, bool) {
     let floor = ts - ts.rem_euclid(SECOND);
-    let ceiling = if floor == ts { ts } else { floor + SECOND };
     if random.chance_with_threshold(late_threshold) {
         match random.below(10) {
-            0 if floor == ts => ts + DAY,
-            1 if floor == ts => ts + DAY + SECOND,
-            _ => ceiling + random.between(DAY / SECOND + 1, 5 * DAY / SECOND) * SECOND,
+            // Exactly one day late admits the original but not a later copy.
+            0 if floor == ts => (true, false),
+            1 if floor == ts => (false, false),
+            _ => {
+                random.skip(1);
+                (false, false)
+            }
         }
     } else if random.chance_with_threshold(EARLY_INGEST_THRESHOLD) {
-        floor - random.between(1, 5) * SECOND
+        random.skip(1);
+        (true, true)
     } else {
-        ceiling + random.between(0, 600) * SECOND
+        random.skip(1);
+        (true, true)
     }
 }
 
