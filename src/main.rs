@@ -630,6 +630,17 @@ struct FastUserDaily {
 }
 
 impl FastUserDaily {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            persons: Vec::with_capacity(capacity),
+            days: Vec::with_capacity(capacity),
+            sessions: Vec::with_capacity(capacity),
+            events: Vec::with_capacity(capacity),
+            revenue: Vec::with_capacity(capacity),
+            top_categories: Vec::with_capacity(capacity),
+        }
+    }
+
     fn len(&self) -> usize {
         self.persons.len()
     }
@@ -1093,13 +1104,15 @@ fn try_run_generator_replay(
         .shards
         .len()
         .div_ceil(rayon::current_num_threads());
+    let expected_daily_rows = event_decoder.rows as usize
+        / (rayon::current_num_threads() * 8).max(1);
     let shard_results: Vec<ReplayShardAggregate> = dataset
         .shards
         .par_chunks(shard_batch)
         .map(|user_ranges| {
             let mut result = ReplayShardAggregate {
                 session_count: 0,
-                user_daily: FastUserDaily::default(),
+                user_daily: FastUserDaily::with_capacity(expected_daily_rows),
                 campaign_daily: vec![CampaignDaily::default(); campaign_rows],
                 shared_events: Vec::new(),
                 shared_clicks: Vec::new(),
